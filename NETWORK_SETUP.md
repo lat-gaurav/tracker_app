@@ -173,6 +173,70 @@ ip route get 192.168.144.101
 
 ---
 
+## Problem & Fix: High Latency and Corrupted Stream on Ground Laptop
+
+### Problem
+
+When playing the RTSP stream on the Ground Laptop via `ffplay`, the video had
+massive packet loss, H264 decoding errors ("concealing X DC, X AC, X MV errors"),
+and high latency (2-5 seconds). The issues:
+
+1. **Resolution too high**: 1280x800 at 2000kbps exceeded the SIYI radio link bandwidth.
+2. **ffplay buffering**: ffplay always adds buffering even with `-fflags nobuffer`.
+3. **UDP packet loss**: Default RTSP uses UDP for media transport, but the SIYI link drops UDP packets.
+4. **UDP push doesn't work**: The SIYI link is one-directional (Ground Laptop → Jetson works, Jetson → Ground Laptop does NOT). So direct UDP streaming from Jetson to Ground Laptop is not possible.
+
+### Diagnosis
+
+```bash
+# On Jetson — tried to ping Ground Laptop through SIYI
+ping -c 3 192.168.43.194
+# Result: Destination Net Unreachable (via both 192.168.144.11 and .12)
+# Conclusion: SIYI only routes inbound (Ground Laptop → Jetson), not outbound
+```
+
+ffplay output showed constant errors:
+```
+[rtsp] RTP: missed 1 packets
+[h264] concealing 640 DC, 640 AC, 640 MV errors in P frame
+```
+
+### Fix (Jetson - stream.py)
+
+Lowered resolution and bitrate to fit SIYI bandwidth:
+
+| Setting | Before | After |
+|---------|--------|-------|
+| Resolution | 1280x800 | 640x360 |
+| Bitrate | 2000 kbps | 500 kbps |
+| Keyframe interval | default | 30 frames (1s) |
+| config-interval | -1 | 1 (SPS/PPS every keyframe) |
+
+### Fix (Ground Laptop - use GStreamer client with TCP)
+
+**Do NOT use ffplay** — use GStreamer with `protocols=tcp`:
+
+```bash
+gst-launch-1.0 rtspsrc location=rtsp://192.168.144.101:8554/stream latency=0 drop-on-latency=true protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
+
+Key flags:
+- `protocols=tcp` — forces TCP transport, avoids UDP packet loss over SIYI link
+- `latency=0` — no jitter buffer
+- `drop-on-latency=true` — drops late packets instead of buffering
+- `sync=false` — renders frames immediately
+
+### What did NOT work
+
+| Approach | Why it failed |
+|----------|--------------|
+| `ffplay -fflags nobuffer -flags low_delay` | Still buffers, massive H264 errors |
+| `ffplay -rtsp_transport tcp` | Better but still high latency |
+| UDP push from Jetson (`stream_udp.py`) | SIYI link doesn't route Jetson → Ground Laptop |
+| RTSP over UDP (default) | Packet loss over SIYI radio link |
+
+---
+
 ## Utility Scripts
 
 ### check_camera.py
@@ -203,5 +267,9 @@ RTSP server with error logging. Reports:
 | stream.py says device not found | Camera unplugged or wrong /dev/videoX | Run `check_camera.py` to find correct device |
 | Server starts but client can't connect | Routing issue on Ground Laptop | Check `ip route get 192.168.144.101` |
 | "No route to host" | Missing or wrong route | Add route: `sudo ip route add 192.168.144.0/24 via 192.168.43.1 dev wlp4s0` |
-| Stream plays but freezes | Bandwidth over SIYI link | Lower bitrate in stream.py (currently 2000kbps) |
+| Stream plays but freezes/artifacts | Bandwidth over SIYI link | Lower bitrate in stream.py (currently 500kbps) |
 | Port 8554 refused | stream.py not running | Start stream.py on Jetson |
+| ffplay shows H264 concealing errors | UDP packet loss over SIYI | Use GStreamer client with `protocols=tcp` |
+| gst-launch stuck at "SETUP stream 0" | UDP blocked by SIYI link | Add `protocols=tcp` to rtspsrc |
+| High latency (2-5s) | Client buffering | Use GStreamer with `latency=0 drop-on-latency=true sync=false` |
+| Jetson can't reach Ground Laptop | SIYI link is one-way only | Use pull model (RTSP), not push (UDP) |
