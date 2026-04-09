@@ -237,6 +237,51 @@ Key flags:
 
 ---
 
+## Problem & Fix: RTSP Stream Freezes / EOS after ~29 Seconds
+
+### Problem
+
+The RTSP stream on the Ground Laptop froze and received EOS (End of Stream) after
+consistently ~29 seconds. The same raw `gst-launch` pipeline also froze. Meanwhile,
+the SIYI remote controller's video display worked flawlessly.
+
+### Root Cause: SIYI Radio Bandwidth Saturation
+
+The SIYI radio link is shared between two video streams when both devices are active:
+
+```
+Jetson
+  ├── RTSP stream (stream.py) → 2000 kbps ──→ over SIYI radio → Ground Laptop
+  └── SIYI air unit video     → ~2-4 Mbps ──→ over SIYI radio → SIYI Remote Controller
+```
+
+When both the SIYI remote controller's video display AND the ground laptop's RTSP
+stream were running simultaneously, the combined bandwidth exceeded the SIYI radio
+link's capacity. This caused TCP congestion, packet loss, and the SIYI NAT router
+dropping the TCP session — appearing as a ~29 second freeze/EOS on the ground laptop.
+
+The SIYI remote controller appeared "flawless" because its video is the SIYI system's
+own native protocol which takes priority, while the RTSP TCP stream suffered.
+
+### Fix
+
+**Close the SIYI remote controller's video display before running the ground station app.**
+Only one video consumer over the SIYI radio link at a time.
+
+### Why TCP keepalive didn't help
+
+We tried `sudo sysctl -w net.ipv4.tcp_keepalive_time=10` — this had no effect because
+`rtspsrc` does not enable `SO_KEEPALIVE` on its socket, so OS-level keepalive settings
+are ignored by GStreamer.
+
+### Troubleshooting checklist for future freezes
+
+1. Is the SIYI remote controller's video display open? → Close it
+2. Is anything else streaming from the Jetson simultaneously? → Check `ss -tn | grep 8554` on Jetson
+3. Is the bitrate too high? → Lower `bitrate=` in stream.py (currently at stream.py settings)
+
+---
+
 ## Utility Scripts
 
 ### check_camera.py
@@ -268,6 +313,7 @@ RTSP server with error logging. Reports:
 | Server starts but client can't connect | Routing issue on Ground Laptop | Check `ip route get 192.168.144.101` |
 | "No route to host" | Missing or wrong route | Add route: `sudo ip route add 192.168.144.0/24 via 192.168.43.1 dev wlp4s0` |
 | Stream plays but freezes/artifacts | Bandwidth over SIYI link | Lower bitrate in stream.py (currently 500kbps) |
+| Stream freezes/EOS at ~29s | SIYI radio bandwidth saturated by two video streams | Close SIYI remote controller's video display — only one video stream over the radio at a time |
 | Port 8554 refused | stream.py not running | Start stream.py on Jetson |
 | ffplay shows H264 concealing errors | UDP packet loss over SIYI | Use GStreamer client with `protocols=tcp` |
 | gst-launch stuck at "SETUP stream 0" | UDP blocked by SIYI link | Add `protocols=tcp` to rtspsrc |

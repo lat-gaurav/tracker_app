@@ -1,6 +1,10 @@
 '''
 use this on the ground laptop side to view the stream 
 gst-launch-1.0 rtspsrc location=rtsp://192.168.144.101:8554/stream latency=0 drop-on-latency=true protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0 \
+gst-launch-1.0 rtspsrc location=rtsp://192.168.144.101:8554/stream \
+  latency=0 drop-on-latency=true protocols=tcp ! \
+  rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! xvimagesink sync=false
 
 '''
 
