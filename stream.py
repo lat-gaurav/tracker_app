@@ -20,7 +20,7 @@ WS_PORT = 5001
 DEVICE = "/dev/video4"
 PORT   = "8554"
 MOUNT  = "/stream"
-IP     = "192.168.144.101"
+IP     = "192.168.144.102"
 WIDTH  = 1280
 HEIGHT = 800
 FPS    = 30
@@ -61,7 +61,7 @@ def capture_and_push():
     FrameProcessor, then pushes the result into the RTSP appsrc.
     Runs in its own daemon thread.
     """
-    global _cap_pipe
+    global _cap_pipe, _appsrc
 
     cap_pipeline = (
         f'v4l2src device={DEVICE} ! '
@@ -106,18 +106,25 @@ def capture_and_push():
 
         frame = processor.process(frame)
 
-        # Push processed frame to appsrc (if RTSP client is connected)
+        # Push processed frame to appsrc (always, to keep encoder warm)
         if _appsrc is not None:
             out_buf = Gst.Buffer.new_wrapped(frame.tobytes())
             out_buf.pts      = pts
             out_buf.duration = frame_duration_ns
             pts += frame_duration_ns
             ret = _appsrc.emit('push-buffer', out_buf)
-            if frame_n % 150 == 0:
+            if ret == Gst.FlowReturn.FLUSHING or ret == Gst.FlowReturn.ERROR:
+                # Pipeline was torn down underneath us — clear the stale reference.
+                # on_media_configure will restore it when the next client triggers
+                # pipeline creation.
+                print(f"[CAP]   push-buffer returned {ret} — pipeline gone, clearing appsrc")
+                _appsrc = None
+                pts = 0   # reset PTS so the new pipeline gets a clean timeline
+            elif frame_n % 150 == 0:
                 print(f"[CAP]   frame={frame_n} push-buffer ret={ret}")
         else:
             if frame_n % 150 == 0:
-                print(f"[CAP]   frame={frame_n} appsrc=None (no client connected)")
+                print(f"[CAP]   frame={frame_n} appsrc=None (waiting for client)")
 
         frame_n += 1
 
@@ -152,6 +159,7 @@ def on_bus_state_changed(_bus, message):
 
 def on_media_configure(_factory, media):
     global _appsrc, _vflip
+    media.set_property('suspend-mode', GstRtspServer.RTSPSuspendMode.NONE)
     pipeline = media.get_element()
     _appsrc  = pipeline.get_by_name('src')
     _vflip   = pipeline.get_by_name('vflip')
@@ -171,9 +179,12 @@ def on_client_connected(_server, _client):
 
 
 def on_client_closed(_client):
-    global _appsrc
-    print("[INFO]  RTSP client disconnected.")
-    _appsrc = None
+    # Do NOT null _appsrc here.
+    # With suspend-mode=NONE the pipeline stays in PLAYING — the capture thread
+    # must keep pushing frames so the encoder stays warm.  The next client will
+    # reuse the same pipeline and see instant video without re-initialization.
+    # _appsrc is only nulled if push-buffer itself signals a pipeline failure.
+    print("[INFO]  RTSP client disconnected — pipeline stays hot.")
 
 
 # ------------------------------------------------------------------ WebSocket server
@@ -258,17 +269,18 @@ def main():
 
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(
-        f'( appsrc name=src is-live=true format=time block=false '
+        f'( appsrc name=src is-live=true format=time block=false max-buffers=1 leaky-type=2 '
         f'caps=video/x-raw,format=BGR,width={WIDTH},height={HEIGHT},framerate={FPS}/1 ! '
         'videoconvert ! video/x-raw,format=I420 ! '
         'videoflip name=vflip method=0 ! '
-        'x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 '
-        'key-int-max=30 bframes=0 sliced-threads=true ! '
+        'nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! '
+        'nvv4l2h264enc bitrate=800000 iframeinterval=30 preset-level=1 insert-sps-pps=1 ! '
         'h264parse config-interval=1 ! '
         'rtph264pay name=pay0 pt=96 aggregate-mode=zero-latency )'
     )
     factory.set_shared(True)
     factory.set_latency(0)
+    factory.set_property('suspend-mode', 0)  # keep pipeline alive with no clients — encoder stays initialized
     factory.connect("media-configure", on_media_configure)
 
     server.get_mount_points().add_factory(MOUNT, factory)

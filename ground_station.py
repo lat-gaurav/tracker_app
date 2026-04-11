@@ -26,11 +26,11 @@ from PyQt6.QtGui import QFont
 
 Gst.init(None)
 
-RTSP_URL             = "rtsp://192.168.144.101:8554/stream"
-WS_URL               = "ws://192.168.144.101:5001"
+RTSP_URL             = "rtsp://192.168.144.102:8554/stream"
+WS_URL               = "ws://192.168.144.102:5001"
 EXPECTED_FPS         = 30
 WATCHDOG_INTERVAL_MS = 500
-WATCHDOG_TIMEOUT_S   = 3.0
+WATCHDOG_TIMEOUT_S   = 8.0
 
 
 class GstSignals(QObject):
@@ -138,9 +138,16 @@ class GroundStation(QMainWindow):
         self.resize(800, 580)
 
         self.pipeline       = None
-        self.glib_loop      = None
-        self.glib_thread    = None
         self.auto_reconnect = False
+
+        # GLib main loop — created once, lives for the full app lifetime.
+        # Running it in a dedicated daemon thread means every pipeline's bus
+        # messages are dispatched on the same stable context.  Re-creating the
+        # loop on every reconnect caused a race where the old thread hadn't
+        # exited before the new loop.run() started on the same default context.
+        self._glib_loop = GLib.MainLoop()
+        _gl = threading.Thread(target=self._glib_loop.run, daemon=True)
+        _gl.start()
         self._last_frame_ts = 0.0
 
         # Health tracking
@@ -298,11 +305,14 @@ class GroundStation(QMainWindow):
         self.auto_reconnect = True
         self._last_frame_ts = time.monotonic()
         self._frame_times.clear()
+        self._first_frame_logged = False
+        print(f"[GS] start_stream() called at t={time.monotonic():.2f}")
 
         self.pipeline = Gst.parse_launch(
-            f'rtspsrc location={RTSP_URL} latency=0 drop-on-latency=true protocols=tcp '
-            'tcp-timeout=3000000 do-rtsp-keep-alive=true ! '
+            f'rtspsrc location={RTSP_URL} latency=200 drop-on-latency=true protocols=tcp '
+            'tcp-timeout=15000000 do-rtsp-keep-alive=true ! '
             'rtph264depay ! h264parse ! avdec_h264 ! '
+            'queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! '
             'videoconvert name=vc ! '
             'xvimagesink name=vsink sync=false handle-events=false'
         )
@@ -319,25 +329,20 @@ class GroundStation(QMainWindow):
         bus.add_signal_watch()
         bus.connect('message', self._on_bus_message)
 
-        self.pipeline.set_state(Gst.State.PLAYING)
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        print(f"[GS] set_state(PLAYING) returned: {ret}")
         self.connect_btn.setText("Disconnect")
         self.status_label.setText("Connecting...")
         self.status_label.setStyleSheet("color: orange;")
 
-        self.glib_loop = GLib.MainLoop()
-        self.glib_thread = threading.Thread(target=self.glib_loop.run, daemon=True)
-        self.glib_thread.start()
-
     def _teardown_pipeline(self):
+        print(f"[GS] _teardown_pipeline() at t={time.monotonic():.2f}")
         self._watchdog.stop()
         self._health_timer.stop()
         self._last_frame_ts = 0.0
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
-        if self.glib_loop:
-            self.glib_loop.quit()
-            self.glib_loop = None
 
     def stop_stream(self):
         self.auto_reconnect = False
@@ -381,6 +386,9 @@ class GroundStation(QMainWindow):
 
     def _on_frame_probe(self, _pad, _info):
         now = time.monotonic()
+        if not getattr(self, '_first_frame_logged', False):
+            print(f"[GS] First frame decoded at t={now:.2f}")
+            self._first_frame_logged = True
         # Rate-limit: update watchdog timestamp at most once per second
         if now - self._last_frame_ts > 1.0:
             self._last_frame_ts = now
@@ -461,19 +469,31 @@ class GroundStation(QMainWindow):
     def _on_bus_message(self, _bus, message):
         t = message.type
         if t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self.pipeline:
-                _, new, _ = message.parse_state_changed()
-                if new == Gst.State.PLAYING:
-                    self.signals.status_changed.emit("Streaming")
-                    self.signals.stream_playing.emit()
+            old, new, _ = message.parse_state_changed()
+            src_name = message.src.get_name() if message.src else "?"
+            old_name = Gst.Element.state_get_name(old)
+            new_name = Gst.Element.state_get_name(new)
+            print(f"[GS STATE] {src_name}: {old_name} -> {new_name}")
+            if message.src == self.pipeline and new == Gst.State.PLAYING:
+                self.signals.status_changed.emit("Streaming")
+                self.signals.stream_playing.emit()
         elif t == Gst.MessageType.ERROR:
-            err, _ = message.parse_error()
-            print(f"[ERROR] {err.message}")
+            err, debug = message.parse_error()
+            src_name = message.src.get_name() if message.src else "?"
+            print(f"[GS ERROR] from {src_name}: {err.message}")
+            if debug:
+                print(f"[GS ERROR] debug: {debug}")
             if self.auto_reconnect:
                 self.signals.reconnect.emit()
         elif t == Gst.MessageType.EOS:
+            src_name = message.src.get_name() if message.src else "?"
+            print(f"[GS EOS] from {src_name} at t={time.monotonic():.2f}")
             if self.auto_reconnect:
                 self.signals.reconnect.emit()
+        elif t == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            src_name = message.src.get_name() if message.src else "?"
+            print(f"[GS WARN] from {src_name}: {warn.message}")
 
     # ------------------------------------------------------------------ qt slots
 
