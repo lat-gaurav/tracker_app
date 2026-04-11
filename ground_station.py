@@ -233,8 +233,9 @@ class GroundStation(QMainWindow):
         self.health_label = QLabel("Health: --%")
         self.uptime_label = QLabel("Uptime: --:--")
         self.reconnect_label = QLabel("Reconnects: 0")
+        self.track_label = QLabel("Track: --")
         for lbl in (self.dot_label, self.fps_label, self.health_label,
-                    self.uptime_label, self.reconnect_label):
+                    self.uptime_label, self.reconnect_label, self.track_label):
             lbl.setStyleSheet("color: gray; font-size: 11px;")
         self.dot_label.setStyleSheet("color: gray; font-size: 14px;")
         health_bar.addWidget(self.dot_label)
@@ -246,6 +247,8 @@ class GroundStation(QMainWindow):
         health_bar.addWidget(self.uptime_label)
         health_bar.addSpacing(12)
         health_bar.addWidget(self.reconnect_label)
+        health_bar.addSpacing(12)
+        health_bar.addWidget(self.track_label)
         health_bar.addStretch()
         main_layout.addLayout(health_bar)
 
@@ -268,6 +271,14 @@ class GroundStation(QMainWindow):
         self.rotate_btn.setFixedWidth(130)
         self.rotate_btn.clicked.connect(self._send_rotate)
 
+        # Box size control
+        self.box_label = QLabel("Box:")
+        self.box_label.setStyleSheet("font-size: 11px;")
+        self.box_input = QLineEdit("20")
+        self.box_input.setFixedWidth(45)
+        self.box_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.box_input.returnPressed.connect(self._send_box_size)
+
         self.ws_response_label = QLabel("")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
@@ -277,6 +288,9 @@ class GroundStation(QMainWindow):
         cmd_bar.addWidget(self.send_btn)
         cmd_bar.addSpacing(8)
         cmd_bar.addWidget(self.rotate_btn)
+        cmd_bar.addSpacing(8)
+        cmd_bar.addWidget(self.box_label)
+        cmd_bar.addWidget(self.box_input)
         main_layout.addLayout(cmd_bar)
 
         main_layout.addWidget(self.ws_response_label)
@@ -522,6 +536,17 @@ class GroundStation(QMainWindow):
         self.ws_response_label.setText(f"Sent: rotate:{method}")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
+    def _send_box_size(self):
+        try:
+            size = int(self.box_input.text())
+            size = max(10, min(200, size))
+            self.box_input.setText(str(size))
+            self._ws_client.send(f"boxsize:{size}")
+            self.ws_response_label.setText(f"Sent: boxsize:{size}")
+            self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        except ValueError:
+            self.box_input.setText("20")
+
     def _on_video_click(self, nx, ny):
         self._ws_client.send(f"click:{nx:.4f},{ny:.4f}")
         self.ws_response_label.setText(f"Sent: click ({nx:.3f}, {ny:.3f})")
@@ -537,6 +562,11 @@ class GroundStation(QMainWindow):
         self.cmd_input.clear()
 
     def _on_ws_message(self, msg):
+        if msg.startswith("status:"):
+            info = msg[7:]   # e.g. "tracking 45.2ms"
+            self.track_label.setText(f"Track: {info}")
+            self.track_label.setStyleSheet("color: #00cc44; font-size: 11px;")
+            return
         self.ws_response_label.setText(f"Jetson: {msg}")
         self.ws_response_label.setStyleSheet("color: #00cc44; font-size: 11px;")
 

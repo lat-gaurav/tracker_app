@@ -104,7 +104,8 @@ def capture_and_push():
         frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape((h, w, 3)).copy()
         buf.unmap(mapinfo)
 
-        frame = processor.process(frame)
+        processor.submit_frame(frame)   # copy to tracker thread (non-blocking)
+        frame = processor.draw(frame)   # draw last known bbox (fast)
 
         # Push processed frame to appsrc (always, to keep encoder warm)
         if _appsrc is not None:
@@ -196,6 +197,19 @@ async def ws_handle(websocket):
     global _vflip, _rotation
     addr = websocket.remote_address
     print(f"[WS]   Client connected: {addr}")
+
+    async def status_sender():
+        """Push tracking stats to ground once per second."""
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                tracking, ms = processor.get_track_info()
+                if tracking:
+                    await websocket.send(f"status:tracking {ms:.1f}ms")
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.ensure_future(status_sender())
     try:
         async for message in websocket:
             print(f"[WS]   Received: {message}")
@@ -212,6 +226,14 @@ async def ws_handle(websocket):
                         reply = "Error: invalid rotation value"
                 except ValueError:
                     reply = "Error: invalid rotate command"
+
+            elif message.startswith("boxsize:"):
+                try:
+                    size = int(message.split(":")[1])
+                    processor.set_box_size(size)
+                    reply = f"Box size set to {size}"
+                except ValueError:
+                    reply = "Error: invalid boxsize command"
 
             elif message.startswith("click:"):
                 try:
@@ -234,6 +256,8 @@ async def ws_handle(websocket):
             print(f"[WS]   Sent: {reply}")
     except websockets.exceptions.ConnectionClosed:
         print(f"[WS]   Client disconnected: {addr}")
+    finally:
+        task.cancel()
 
 
 async def ws_main():
@@ -291,6 +315,11 @@ def main():
 
     loop.run()
     print("[INFO]  Server stopped.")
+
+    # Force exit — daemon threads (capture, tracker, websocket) won't block,
+    # but GLib/GStreamer may have lingering callbacks that prevent clean shutdown.
+    import os
+    os._exit(0)
 
 
 if __name__ == "__main__":
