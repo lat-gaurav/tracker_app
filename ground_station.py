@@ -21,7 +21,7 @@ from gi.repository import Gst, GLib, GstVideo
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox,
-    QSizePolicy
+    QSizePolicy, QCheckBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont
@@ -243,8 +243,10 @@ class GroundStation(QMainWindow):
         self.uptime_label = QLabel("Uptime: --:--")
         self.reconnect_label = QLabel("Reconnects: 0")
         self.track_label = QLabel("Track: --")
+        self.det_label   = QLabel("Det: --")
         for lbl in (self.dot_label, self.fps_label, self.health_label,
-                    self.uptime_label, self.reconnect_label, self.track_label):
+                    self.uptime_label, self.reconnect_label, self.track_label,
+                    self.det_label):
             lbl.setStyleSheet("color: gray; font-size: 11px;")
         self.dot_label.setStyleSheet("color: gray; font-size: 14px;")
         health_bar.addWidget(self.dot_label)
@@ -258,6 +260,8 @@ class GroundStation(QMainWindow):
         health_bar.addWidget(self.reconnect_label)
         health_bar.addSpacing(12)
         health_bar.addWidget(self.track_label)
+        health_bar.addSpacing(12)
+        health_bar.addWidget(self.det_label)
         health_bar.addStretch()
         main_layout.addLayout(health_bar)
 
@@ -280,13 +284,41 @@ class GroundStation(QMainWindow):
         self.rotate_btn.setFixedWidth(130)
         self.rotate_btn.clicked.connect(self._send_rotate)
 
-        # Box size control
+        # Box size controls — square mode (single "Box") or separate W/H (via checkbox)
         self.box_label = QLabel("Box:")
         self.box_label.setStyleSheet("font-size: 11px;")
         self.box_input = QLineEdit("20")
         self.box_input.setFixedWidth(45)
         self.box_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.box_input.returnPressed.connect(self._send_box_size)
+
+        self.box_wh_check = QCheckBox("W×H")
+        self.box_wh_check.setStyleSheet("font-size: 11px;")
+        self.box_wh_check.toggled.connect(self._on_box_wh_toggled)
+
+        self.box_w_input = QLineEdit("20")
+        self.box_w_input.setFixedWidth(45)
+        self.box_w_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.box_w_input.setEnabled(False)
+        self.box_w_input.returnPressed.connect(self._send_box_size)
+
+        self.box_h_input = QLineEdit("20")
+        self.box_h_input.setFixedWidth(45)
+        self.box_h_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.box_h_input.setEnabled(False)
+        self.box_h_input.returnPressed.connect(self._send_box_size)
+
+        # Detection toggle
+        self._detect_on = False
+        self.detect_btn = QPushButton("Detect: OFF")
+        self.detect_btn.setFixedWidth(110)
+        self.detect_btn.setCheckable(True)
+        self.detect_btn.clicked.connect(self._toggle_detect)
+
+        # Stop-tracker button — clears the active CSRT tracker
+        self.stop_track_btn = QPushButton("Stop Track")
+        self.stop_track_btn.setFixedWidth(100)
+        self.stop_track_btn.clicked.connect(self._stop_track)
 
         self.ws_response_label = QLabel("")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
@@ -300,6 +332,14 @@ class GroundStation(QMainWindow):
         cmd_bar.addSpacing(8)
         cmd_bar.addWidget(self.box_label)
         cmd_bar.addWidget(self.box_input)
+        cmd_bar.addSpacing(4)
+        cmd_bar.addWidget(self.box_wh_check)
+        cmd_bar.addWidget(self.box_w_input)
+        cmd_bar.addWidget(self.box_h_input)
+        cmd_bar.addSpacing(8)
+        cmd_bar.addWidget(self.detect_btn)
+        cmd_bar.addSpacing(4)
+        cmd_bar.addWidget(self.stop_track_btn)
         main_layout.addLayout(cmd_bar)
 
         main_layout.addWidget(self.ws_response_label)
@@ -553,16 +593,57 @@ class GroundStation(QMainWindow):
         self.ws_response_label.setText(f"Sent: rotate:{method}")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
+    def _stop_track(self):
+        self._ws_client.send("clear_track")
+        self.ws_response_label.setText("Sent: clear_track")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        self.track_label.setText("Track: --")
+        self.track_label.setStyleSheet("color: gray; font-size: 11px;")
+
+    def _toggle_detect(self):
+        self._detect_on = not self._detect_on
+        self.detect_btn.setText(f"Detect: {'ON' if self._detect_on else 'OFF'}")
+        self._ws_client.send(f"detect:{'on' if self._detect_on else 'off'}")
+        self.ws_response_label.setText(f"Sent: detect:{'on' if self._detect_on else 'off'}")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        if not self._detect_on:
+            self.det_label.setText("Det: --")
+            self.det_label.setStyleSheet("color: gray; font-size: 11px;")
+
+    def _on_box_wh_toggled(self, checked):
+        """Toggle between square (Box) and separate W/H modes."""
+        self.box_input.setEnabled(not checked)
+        self.box_w_input.setEnabled(checked)
+        self.box_h_input.setEnabled(checked)
+        if checked:
+            # Seed W/H from the current square Box value for convenience
+            try:
+                s = int(self.box_input.text())
+                self.box_w_input.setText(str(s))
+                self.box_h_input.setText(str(s))
+            except ValueError:
+                pass
+        self._send_box_size()
+
     def _send_box_size(self):
         try:
-            size = int(self.box_input.text())
-            size = max(10, min(200, size))
-            self.box_input.setText(str(size))
-            self._ws_client.send(f"boxsize:{size}")
-            self.ws_response_label.setText(f"Sent: boxsize:{size}")
+            if self.box_wh_check.isChecked():
+                w = max(10, min(400, int(self.box_w_input.text())))
+                h = max(10, min(400, int(self.box_h_input.text())))
+                self.box_w_input.setText(str(w))
+                self.box_h_input.setText(str(h))
+                self._ws_client.send(f"boxsize:{w},{h}")
+                self.ws_response_label.setText(f"Sent: boxsize:{w},{h}")
+            else:
+                size = max(10, min(400, int(self.box_input.text())))
+                self.box_input.setText(str(size))
+                self._ws_client.send(f"boxsize:{size}")
+                self.ws_response_label.setText(f"Sent: boxsize:{size}")
             self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         except ValueError:
             self.box_input.setText("20")
+            self.box_w_input.setText("20")
+            self.box_h_input.setText("20")
 
     def _on_source_changed(self, index):
         if index < 0:
@@ -588,10 +669,15 @@ class GroundStation(QMainWindow):
         self.cmd_input.clear()
 
     def _on_ws_message(self, msg):
-        if msg.startswith("status:"):
-            info = msg[7:]
+        if msg.startswith("status:tracking "):
+            info = msg[len("status:tracking "):]
             self.track_label.setText(f"Track: {info}")
             self.track_label.setStyleSheet("color: #00cc44; font-size: 11px;")
+            return
+        if msg.startswith("status:detection "):
+            info = msg[len("status:detection "):]
+            self.det_label.setText(f"Det: {info}")
+            self.det_label.setStyleSheet("color: #00cc44; font-size: 11px;")
             return
         if msg.startswith("sources:"):
             data = json.loads(msg[8:])

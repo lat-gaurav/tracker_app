@@ -307,13 +307,16 @@ async def ws_handle(websocket):
     print(f"[WS]   Client connected: {addr}")
 
     async def status_sender():
-        """Push tracking stats to ground once per second."""
+        """Push tracking + detection stats to ground once per second."""
         try:
             while True:
                 await asyncio.sleep(1.0)
-                tracking, ms = processor.get_track_info()
+                tracking, t_ms = processor.get_track_info()
                 if tracking:
-                    await websocket.send(f"status:tracking {ms:.1f}ms")
+                    await websocket.send(f"status:tracking {t_ms:.1f}ms")
+                det_on, d_ms, d_count = processor.get_det_info()
+                if det_on:
+                    await websocket.send(f"status:detection {d_ms:.1f}ms objects={d_count}")
         except asyncio.CancelledError:
             pass
 
@@ -335,6 +338,16 @@ async def ws_handle(websocket):
                 except ValueError:
                     reply = "Error: invalid rotate command"
 
+            elif message == "clear_track":
+                processor.clear_track()
+                reply = "Tracker cleared"
+
+            elif message.startswith("detect:"):
+                val = message.split(":", 1)[1].strip().lower()
+                on = val in ("on", "1", "true")
+                processor.enable_detector(on)
+                reply = f"Detection {'ON' if on else 'OFF'}"
+
             elif message == "list_sources":
                 sources = get_available_sources()
                 reply = f"sources:{json.dumps(sources)}"
@@ -349,9 +362,15 @@ async def ws_handle(websocket):
 
             elif message.startswith("boxsize:"):
                 try:
-                    size = int(message.split(":")[1])
-                    processor.set_box_size(size)
-                    reply = f"Box size set to {size}"
+                    val = message.split(":", 1)[1]
+                    if "," in val:
+                        w, h = map(int, val.split(","))
+                        processor.set_box_size(w, h)
+                        reply = f"Box size set to {w}x{h}"
+                    else:
+                        size = int(val)
+                        processor.set_box_size(size)
+                        reply = f"Box size set to {size}x{size}"
                 except ValueError:
                     reply = "Error: invalid boxsize command"
 
