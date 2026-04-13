@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from collections import deque
+import json
 import websocket   # websocket-client
 
 os.environ.setdefault(
@@ -19,7 +20,8 @@ from gi.repository import Gst, GLib, GstVideo
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget,
-    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit
+    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox,
+    QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont
@@ -90,16 +92,21 @@ class ClickableVideoWidget(QWidget):
 
     # Native video dimensions per rotation method
     VIDEO_DIMS = {
-        0: (1280, 800),   # no rotation
-        1: (800, 1280),   # 90° CW  — dimensions swap
-        2: (1280, 800),   # 180°
-        3: (800, 1280),   # 270° CW — dimensions swap
+        0: (1920, 1080),   # no rotation
+        1: (1080, 1920),   # 90° CW  — dimensions swap
+        2: (1920, 1080),   # 180°
+        3: (1080, 1920),   # 270° CW — dimensions swap
     }
 
     def __init__(self, on_click, parent=None):
         super().__init__(parent)
         self._on_click    = on_click
         self._rotate_method = 0
+        # Ensure the widget has its own native X11 window so xvimagesink can embed
+        # and correctly receive ConfigureNotify events on resize.
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     def set_rotation(self, method):
         self._rotate_method = method
@@ -135,7 +142,7 @@ class GroundStation(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ground Station")
-        self.resize(800, 580)
+        self.resize(1280, 800)
 
         self.pipeline       = None
         self.auto_reconnect = False
@@ -196,11 +203,13 @@ class GroundStation(QMainWindow):
 
         # Video stack — page 0: live stream | page 1: offline screen
         self.video_stack = QStackedWidget()
-        self.video_stack.setMinimumSize(640, 480)
+        self.video_stack.setMinimumSize(640, 360)
+        self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # Page 0 — xvimagesink renders here
         self.video_widget = ClickableVideoWidget(self._on_video_click)
         self.video_widget.setStyleSheet("background-color: black;")
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_stack.addWidget(self.video_widget)
 
         # Page 1 — offline screen
@@ -224,7 +233,7 @@ class GroundStation(QMainWindow):
         offline_layout.addWidget(self._offline_attempt_label)
         self.video_stack.addWidget(offline_widget)
 
-        main_layout.addWidget(self.video_stack)
+        main_layout.addWidget(self.video_stack, 1)   # stretch factor so video row consumes all spare vertical space
 
         # Health bar
         health_bar = QHBoxLayout()
@@ -299,10 +308,18 @@ class GroundStation(QMainWindow):
         controls = QHBoxLayout()
         self.status_label = QLabel("Disconnected")
         self.status_label.setStyleSheet("color: gray;")
+
+        self.source_combo = QComboBox()
+        self.source_combo.setMinimumWidth(250)
+        self.source_combo.addItem("Camera: /dev/video4", "/dev/video4")
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setFixedWidth(120)
         self.connect_btn.clicked.connect(self.toggle_stream)
         controls.addWidget(self.status_label)
+        controls.addSpacing(8)
+        controls.addWidget(self.source_combo)
         controls.addStretch()
         controls.addWidget(self.connect_btn)
         main_layout.addLayout(controls)
@@ -547,6 +564,15 @@ class GroundStation(QMainWindow):
         except ValueError:
             self.box_input.setText("20")
 
+    def _on_source_changed(self, index):
+        if index < 0:
+            return
+        path = self.source_combo.itemData(index)
+        if path:
+            self._ws_client.send(f"source:{path}")
+            self.ws_response_label.setText(f"Sent: source:{os.path.basename(path)}")
+            self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
     def _on_video_click(self, nx, ny):
         self._ws_client.send(f"click:{nx:.4f},{ny:.4f}")
         self.ws_response_label.setText(f"Sent: click ({nx:.3f}, {ny:.3f})")
@@ -563,9 +589,27 @@ class GroundStation(QMainWindow):
 
     def _on_ws_message(self, msg):
         if msg.startswith("status:"):
-            info = msg[7:]   # e.g. "tracking 45.2ms"
+            info = msg[7:]
             self.track_label.setText(f"Track: {info}")
             self.track_label.setStyleSheet("color: #00cc44; font-size: 11px;")
+            return
+        if msg.startswith("sources:"):
+            data = json.loads(msg[8:])
+            current = data.get("current", "")
+            self.source_combo.blockSignals(True)
+            self.source_combo.clear()
+            select_idx = 0
+            for cam in data.get("cameras", []):
+                self.source_combo.addItem(f"Camera: {cam}", cam)
+                if cam == current:
+                    select_idx = self.source_combo.count() - 1
+            for vid in data.get("videos", []):
+                name = os.path.basename(vid)
+                self.source_combo.addItem(f"Video: {name}", vid)
+                if vid == current:
+                    select_idx = self.source_combo.count() - 1
+            self.source_combo.setCurrentIndex(select_idx)
+            self.source_combo.blockSignals(False)
             return
         self.ws_response_label.setText(f"Jetson: {msg}")
         self.ws_response_label.setStyleSheet("color: #00cc44; font-size: 11px;")
@@ -574,10 +618,19 @@ class GroundStation(QMainWindow):
         self.ws_status_label.setText(f"WS: {status}")
         if "Connected" in status:
             self.ws_status_label.setStyleSheet("color: #00cc44; font-size: 11px;")
+            self._ws_client.send("list_sources")
         elif "Error" in status or "Disconnected" in status:
             self.ws_status_label.setStyleSheet("color: #ff3333; font-size: 11px;")
         else:
             self.ws_status_label.setStyleSheet("color: orange; font-size: 11px;")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Tell xvimagesink to repaint at the new widget size
+        if self.pipeline:
+            vsink = self.pipeline.get_by_name('vsink')
+            if vsink:
+                vsink.expose()
 
     def closeEvent(self, event):
         self._ws_client.disconnect()
