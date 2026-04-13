@@ -21,7 +21,8 @@ from gi.repository import Gst, GLib, GstVideo
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox,
-    QSizePolicy, QCheckBox
+    QSizePolicy, QCheckBox, QTabWidget, QFormLayout, QGridLayout, QFrame,
+    QMessageBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont
@@ -233,7 +234,20 @@ class GroundStation(QMainWindow):
         offline_layout.addWidget(self._offline_attempt_label)
         self.video_stack.addWidget(offline_widget)
 
-        main_layout.addWidget(self.video_stack, 1)   # stretch factor so video row consumes all spare vertical space
+        # Top section: video (expanding) + right-side config panel
+        top_section = QHBoxLayout()
+        top_section.setSpacing(6)
+        top_section.addWidget(self.video_stack, 1)
+
+        # Right-side config panel (will be filled later)
+        self._config_panel = QWidget()
+        self._config_panel.setFixedWidth(340)
+        self._config_panel_layout = QVBoxLayout(self._config_panel)
+        self._config_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self._config_panel_layout.setSpacing(6)
+        top_section.addWidget(self._config_panel)
+
+        main_layout.addLayout(top_section, 1)
 
         # Health bar
         health_bar = QHBoxLayout()
@@ -265,104 +279,104 @@ class GroundStation(QMainWindow):
         health_bar.addStretch()
         main_layout.addLayout(health_bar)
 
-        # Command bar
-        cmd_bar = QHBoxLayout()
+        # Tracked dict: dotted-path -> widget, for populating from config
+        self._param_widgets = {}
+        self._config = {}
+
+        # ================================================================
+        #  Widget creation (placed into the bottom bar further below)
+        # ================================================================
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setStyleSheet("color: gray; font-size: 12px;")
         self.ws_status_label = QLabel("WS: --")
         self.ws_status_label.setStyleSheet("color: gray; font-size: 11px;")
-        self.cmd_input = QLineEdit()
-        self.cmd_input.setPlaceholderText("Type a command...")
-        self.cmd_input.returnPressed.connect(self._send_command)
-        self.send_btn = QPushButton("Send")
-        self.send_btn.setFixedWidth(70)
-        self.send_btn.clicked.connect(self._send_command)
 
-        # Rotate button — cycles 0° → 90° → 180° → 270° → 0°
+        self.source_combo = QComboBox()
+        self.source_combo.setMinimumWidth(240)
+        self.source_combo.addItem("Camera: /dev/video4", "/dev/video4")
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+
         self._rotate_steps  = [0, 1, 2, 3]
         self._rotate_labels = ["Rotate: 0°", "Rotate: 90°", "Rotate: 180°", "Rotate: 270°"]
         self._rotate_index  = 0
         self.rotate_btn = QPushButton(self._rotate_labels[0])
-        self.rotate_btn.setFixedWidth(130)
+        self.rotate_btn.setFixedWidth(110)
         self.rotate_btn.clicked.connect(self._send_rotate)
 
-        # Box size controls — square mode (single "Box") or separate W/H (via checkbox)
-        self.box_label = QLabel("Box:")
-        self.box_label.setStyleSheet("font-size: 11px;")
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setFixedWidth(110)
+        self.connect_btn.clicked.connect(self.toggle_stream)
+
         self.box_input = QLineEdit("20")
-        self.box_input.setFixedWidth(45)
+        self.box_input.setFixedWidth(50)
         self.box_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.box_input.returnPressed.connect(self._send_box_size)
+        # editingFinished: fires on Enter OR focus-loss, so clicking Save /
+        # any other widget without pressing Enter still commits the value.
+        self.box_input.editingFinished.connect(self._send_box_size)
 
         self.box_wh_check = QCheckBox("W×H")
         self.box_wh_check.setStyleSheet("font-size: 11px;")
         self.box_wh_check.toggled.connect(self._on_box_wh_toggled)
 
-        self.box_w_input = QLineEdit("20")
-        self.box_w_input.setFixedWidth(45)
-        self.box_w_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.box_w_input.setEnabled(False)
-        self.box_w_input.returnPressed.connect(self._send_box_size)
+        self.box_w_input = QLineEdit("20"); self.box_w_input.setFixedWidth(50); self.box_w_input.setAlignment(Qt.AlignmentFlag.AlignCenter); self.box_w_input.setEnabled(False); self.box_w_input.editingFinished.connect(self._send_box_size)
+        self.box_h_input = QLineEdit("20"); self.box_h_input.setFixedWidth(50); self.box_h_input.setAlignment(Qt.AlignmentFlag.AlignCenter); self.box_h_input.setEnabled(False); self.box_h_input.editingFinished.connect(self._send_box_size)
 
-        self.box_h_input = QLineEdit("20")
-        self.box_h_input.setFixedWidth(45)
-        self.box_h_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.box_h_input.setEnabled(False)
-        self.box_h_input.returnPressed.connect(self._send_box_size)
+        self.stop_track_btn = QPushButton("Stop Track")
+        self.stop_track_btn.setFixedWidth(100)
+        self.stop_track_btn.clicked.connect(self._stop_track)
 
-        # Detection toggle
         self._detect_on = False
         self.detect_btn = QPushButton("Detect: OFF")
         self.detect_btn.setFixedWidth(110)
         self.detect_btn.setCheckable(True)
         self.detect_btn.clicked.connect(self._toggle_detect)
 
-        # Stop-tracker button — clears the active CSRT tracker
-        self.stop_track_btn = QPushButton("Stop Track")
-        self.stop_track_btn.setFixedWidth(100)
-        self.stop_track_btn.clicked.connect(self._stop_track)
+        # ================================================================
+        #  Right-side config panel (tabs + save button)
+        # ================================================================
+        self.config_tabs = QTabWidget()
+        self.config_tabs.addTab(self._build_tracker_tab(),   "Tracker")
+        self.config_tabs.addTab(self._build_detection_tab(), "Detection")
+        self.config_tabs.addTab(self._build_advanced_tab(),  "Advanced")
+        self._config_panel_layout.addWidget(self.config_tabs, 1)
 
+        self.save_default_btn = QPushButton("Save as Default (Jetson)")
+        self.save_default_btn.setToolTip(
+            "Write the current Jetson-side config to config/default.yaml so it "
+            "is loaded on the next stream.py start.")
+        self.save_default_btn.clicked.connect(self._save_default)
+        self._config_panel_layout.addWidget(self.save_default_btn)
+
+        # Response / last-message bar (just above bottom controls)
         self.ws_response_label = QLabel("")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-
-        cmd_bar.addWidget(self.ws_status_label)
-        cmd_bar.addSpacing(8)
-        cmd_bar.addWidget(self.cmd_input)
-        cmd_bar.addWidget(self.send_btn)
-        cmd_bar.addSpacing(8)
-        cmd_bar.addWidget(self.rotate_btn)
-        cmd_bar.addSpacing(8)
-        cmd_bar.addWidget(self.box_label)
-        cmd_bar.addWidget(self.box_input)
-        cmd_bar.addSpacing(4)
-        cmd_bar.addWidget(self.box_wh_check)
-        cmd_bar.addWidget(self.box_w_input)
-        cmd_bar.addWidget(self.box_h_input)
-        cmd_bar.addSpacing(8)
-        cmd_bar.addWidget(self.detect_btn)
-        cmd_bar.addSpacing(4)
-        cmd_bar.addWidget(self.stop_track_btn)
-        main_layout.addLayout(cmd_bar)
-
         main_layout.addWidget(self.ws_response_label)
 
-        # Controls bar
-        controls = QHBoxLayout()
-        self.status_label = QLabel("Disconnected")
-        self.status_label.setStyleSheet("color: gray;")
-
-        self.source_combo = QComboBox()
-        self.source_combo.setMinimumWidth(250)
-        self.source_combo.addItem("Camera: /dev/video4", "/dev/video4")
-        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
-
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setFixedWidth(120)
-        self.connect_btn.clicked.connect(self.toggle_stream)
-        controls.addWidget(self.status_label)
-        controls.addSpacing(8)
-        controls.addWidget(self.source_combo)
-        controls.addStretch()
-        controls.addWidget(self.connect_btn)
-        main_layout.addLayout(controls)
+        # ================================================================
+        #  Bottom control bar — primary operator controls, always visible
+        # ================================================================
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addWidget(QLabel("Source:"))
+        bottom_bar.addWidget(self.source_combo)
+        bottom_bar.addSpacing(8)
+        bottom_bar.addWidget(self.rotate_btn)
+        bottom_bar.addSpacing(12)
+        bottom_bar.addWidget(QLabel("Box:"))
+        bottom_bar.addWidget(self.box_input)
+        bottom_bar.addWidget(self.box_wh_check)
+        bottom_bar.addWidget(QLabel("W")); bottom_bar.addWidget(self.box_w_input)
+        bottom_bar.addWidget(QLabel("H")); bottom_bar.addWidget(self.box_h_input)
+        bottom_bar.addSpacing(12)
+        bottom_bar.addWidget(self.stop_track_btn)
+        bottom_bar.addSpacing(4)
+        bottom_bar.addWidget(self.detect_btn)
+        bottom_bar.addStretch()
+        bottom_bar.addWidget(self.ws_status_label)
+        bottom_bar.addSpacing(8)
+        bottom_bar.addWidget(self.status_label)
+        bottom_bar.addSpacing(8)
+        bottom_bar.addWidget(self.connect_btn)
+        main_layout.addLayout(bottom_bar)
 
     # ------------------------------------------------------------------ stream
 
@@ -593,6 +607,245 @@ class GroundStation(QMainWindow):
         self.ws_response_label.setText(f"Sent: rotate:{method}")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
+    # ================================================================
+    #  Config-tab builders + helpers
+    # ================================================================
+
+    def _param_line_edit(self, path, placeholder="", width=80):
+        w = QLineEdit()
+        w.setFixedWidth(width)
+        w.setPlaceholderText(placeholder)
+        w.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # editingFinished fires on Enter OR focus-loss, so clicking Save
+        # without first pressing Enter still sends the new value.
+        def commit(p=path, w=w):
+            t = w.text().strip()
+            if t:
+                self._set_param(p, t)
+        w.editingFinished.connect(commit)
+        self._param_widgets[path] = w
+        return w
+
+    def _param_check(self, path, text=""):
+        c = QCheckBox(text)
+
+        def on_toggle(on, p=path, w=c):
+            # AI features need Detect: ON — block the toggle and warn otherwise.
+            if on and (p.startswith("tracker.ai_assist.")
+                       or p.startswith("tracker.ai_acquisition.")):
+                if not self._detect_on:
+                    QMessageBox.warning(
+                        self, "Detection is OFF",
+                        "AI features need YOLO detection running.\n\n"
+                        "Turn ON the Detect button (bottom bar) first, then "
+                        "enable this option.")
+                    w.blockSignals(True)
+                    w.setChecked(False)
+                    w.blockSignals(False)
+                    return
+            self._set_param(p, "true" if on else "false")
+
+        c.toggled.connect(on_toggle)
+        self._param_widgets[path] = c
+        return c
+
+    def _section_header(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color: #cccccc; font-size: 11px; font-weight: bold; "
+            "border-top: 1px solid #333; padding-top: 6px; margin-top: 4px;"
+        )
+        return lbl
+
+    def _build_tracker_tab(self):
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(10, 8, 10, 8)
+        form.setSpacing(6)
+
+        # --- CSRT box ---
+        form.addRow(self._section_header("CSRT init box"))
+        form.addRow("Default box W:", self._param_line_edit("tracker.box_w_default"))
+        form.addRow("Default box H:", self._param_line_edit("tracker.box_h_default"))
+        form.addRow("Min box size:",  self._param_line_edit("tracker.box_min"))
+        form.addRow("Max box size:",  self._param_line_edit("tracker.box_max"))
+
+        # --- Acquisition Assist ---
+        form.addRow(self._section_header("Acquisition Assist"))
+        form.addRow("Enabled:", self._param_check("tracker.acq_assist.enabled"))
+        form.addRow("Margin (fraction):", self._param_line_edit("tracker.acq_assist.margin"))
+        acq_note = QLabel("Refines click bbox to dominant Shi-Tomasi corner cluster.")
+        acq_note.setStyleSheet("color: #888888; font-size: 10px;")
+        acq_note.setWordWrap(True)
+        form.addRow("", acq_note)
+
+        # --- AI Acquisition (click-time snap) ---
+        form.addRow(self._section_header("AI Acquisition"))
+        form.addRow("Enabled:",              self._param_check("tracker.ai_acquisition.enabled"))
+        form.addRow("Near distance (px):",   self._param_line_edit("tracker.ai_acquisition.near_val"))
+        ai_acq_note = QLabel("On click, if a YOLO detection is within this distance "
+                             "of the click, use the detection's bbox instead of the "
+                             "raw click bbox.  Requires Detect: ON.")
+        ai_acq_note.setStyleSheet("color: #888888; font-size: 10px;")
+        ai_acq_note.setWordWrap(True)
+        form.addRow("", ai_acq_note)
+
+        # --- AI Track Assist (periodic snap) ---
+        form.addRow(self._section_header("AI Track Assist"))
+        form.addRow("Enabled:",            self._param_check("tracker.ai_assist.enabled"))
+        form.addRow("Interval (frames):",  self._param_line_edit("tracker.ai_assist.interval"))
+        form.addRow("Min IoU:",            self._param_line_edit("tracker.ai_assist.iou_min"))
+        form.addRow("Min conf (assist):",  self._param_line_edit("tracker.ai_assist.conf_min"))
+        ai_note = QLabel("Periodically snaps tracker to overlapping YOLO detection. "
+                         "'Min conf (assist)' is a LOWER threshold than the display "
+                         "one — low-confidence detections help assist without "
+                         "cluttering the screen.  ▽ on bbox = active.  Requires Detect: ON.")
+        ai_note.setStyleSheet("color: #888888; font-size: 10px;")
+        ai_note.setWordWrap(True)
+        form.addRow("", ai_note)
+
+        # --- Jump detector ---
+        form.addRow(self._section_header("Jump detector"))
+        form.addRow("Enabled:",            self._param_check("jump_detector.enabled"))
+        form.addRow("Distance threshold:", self._param_line_edit("jump_detector.dist_thresh"))
+        form.addRow("Size threshold:",     self._param_line_edit("jump_detector.size_thresh"))
+        form.addRow("IoU threshold:",      self._param_line_edit("jump_detector.iou_thresh"))
+
+        # --- Kalman filter ---
+        form.addRow(self._section_header("Kalman filter (SORT)"))
+        form.addRow("Enabled:",         self._param_check("kalman.enabled"))
+        form.addRow("Process noise:",   self._param_line_edit("kalman.process_noise"))
+        form.addRow("Measure noise:",   self._param_line_edit("kalman.measure_noise"))
+        kalman_note = QLabel("Applied on next Stop Track → click.")
+        kalman_note.setStyleSheet("color: #888888; font-size: 10px;")
+        form.addRow("", kalman_note)
+        return w
+
+    def _build_detection_tab(self):
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(10, 8, 10, 8)
+        form.setSpacing(6)
+
+        # Model section (populated by list_models WS response)
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(240)
+        self.model_combo.addItem("(waiting for list_models…)", "")
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        form.addRow("Model:", self.model_combo)
+
+        restart_hint = QLabel("(reloads live; ~3-5s engine load on first inference)")
+        restart_hint.setStyleSheet("color: #888888; font-size: 10px;")
+        form.addRow("", restart_hint)
+
+        form.addRow("Confidence threshold:", self._param_line_edit("detection.conf_thresh"))
+        form.addRow("Top-N per class:",      self._param_line_edit("detection.top_n"))
+        form.addRow("Vehicle class names:",  self._param_line_edit("detection.vehicle_names", "car,truck,…", width=240))
+        form.addRow("Person class names:",   self._param_line_edit("detection.person_names",  "person,pedestrian", width=240))
+        return w
+
+    def _on_model_changed(self, index):
+        if index < 0:
+            return
+        path = self.model_combo.itemData(index)
+        if path:
+            self._set_param("model.yolo_path", path)
+
+    def _build_advanced_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        row = QHBoxLayout()
+        self.cmd_input = QLineEdit()
+        self.cmd_input.setPlaceholderText("Raw WebSocket command (e.g. set_param:jump_detector.enabled=false)")
+        self.cmd_input.returnPressed.connect(self._send_command)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setFixedWidth(70)
+        self.send_btn.clicked.connect(self._send_command)
+        row.addWidget(self.cmd_input)
+        row.addWidget(self.send_btn)
+        v.addLayout(row)
+
+        hint = QLabel("Commands: set_param:PATH=VALUE | get_config | save_default | "
+                      "list_sources | source:PATH | rotate:N | click:NX,NY | "
+                      "boxsize:N[,M] | detect:on|off | clear_track")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888888; font-size: 10px;")
+        v.addWidget(hint)
+        return w
+
+    def _save_default(self):
+        """Force any currently-focused QLineEdit to commit its value (by
+        pulling focus away), then tell the Jetson to persist the config."""
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QLineEdit):
+            fw.clearFocus()         # triggers editingFinished → set_param
+        # Small delay so the set_param packet goes out before save_default
+        QTimer.singleShot(50, lambda: self._ws_client.send("save_default"))
+        self.ws_response_label.setText("Sent: save_default")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
+    def _set_param(self, path, value):
+        self._ws_client.send(f"set_param:{path}={value}")
+        self.ws_response_label.setText(f"Sent: set_param:{path}={value}")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
+    def _apply_config_to_ui(self, cfg):
+        self._config = cfg
+        for path, widget in self._param_widgets.items():
+            try:
+                val = cfg
+                for k in path.split("."):
+                    val = val[k]
+            except (KeyError, TypeError):
+                continue
+            if isinstance(widget, QCheckBox):
+                widget.blockSignals(True)
+                widget.setChecked(bool(val))
+                widget.blockSignals(False)
+            elif isinstance(widget, QLineEdit):
+                widget.blockSignals(True)
+                if isinstance(val, list):
+                    widget.setText(",".join(str(x) for x in val))
+                else:
+                    widget.setText(str(val))
+                widget.blockSignals(False)
+
+        # Sync the bottom-bar Box / W / H inputs to the saved defaults so the
+        # operator sees the same number the Jetson is actually using.
+        bw = cfg.get("tracker", {}).get("box_w_default")
+        bh = cfg.get("tracker", {}).get("box_h_default")
+        if bw is not None and bh is not None:
+            self.box_input.blockSignals(True)
+            self.box_w_input.blockSignals(True)
+            self.box_h_input.blockSignals(True)
+            # If W==H, treat as square; otherwise switch to W×H mode automatically
+            if bw == bh:
+                self.box_input.setText(str(bw))
+                self.box_w_input.setText(str(bw))
+                self.box_h_input.setText(str(bh))
+                self.box_wh_check.blockSignals(True)
+                self.box_wh_check.setChecked(False)
+                self.box_wh_check.blockSignals(False)
+                self.box_input.setEnabled(True)
+                self.box_w_input.setEnabled(False)
+                self.box_h_input.setEnabled(False)
+            else:
+                self.box_input.setText(str(bw))
+                self.box_w_input.setText(str(bw))
+                self.box_h_input.setText(str(bh))
+                self.box_wh_check.blockSignals(True)
+                self.box_wh_check.setChecked(True)
+                self.box_wh_check.blockSignals(False)
+                self.box_input.setEnabled(False)
+                self.box_w_input.setEnabled(True)
+                self.box_h_input.setEnabled(True)
+            self.box_input.blockSignals(False)
+            self.box_w_input.blockSignals(False)
+            self.box_h_input.blockSignals(False)
+
     def _stop_track(self):
         self._ws_client.send("clear_track")
         self.ws_response_label.setText("Sent: clear_track")
@@ -609,6 +862,15 @@ class GroundStation(QMainWindow):
         if not self._detect_on:
             self.det_label.setText("Det: --")
             self.det_label.setStyleSheet("color: gray; font-size: 11px;")
+            # Auto-disable any AI features that depend on detection
+            for ai_path in ("tracker.ai_assist.enabled",
+                            "tracker.ai_acquisition.enabled"):
+                w = self._param_widgets.get(ai_path)
+                if w is not None and w.isChecked():
+                    w.blockSignals(True)
+                    w.setChecked(False)
+                    w.blockSignals(False)
+                    self._set_param(ai_path, "false")
 
     def _on_box_wh_toggled(self, checked):
         """Toggle between square (Box) and separate W/H modes."""
@@ -626,24 +888,32 @@ class GroundStation(QMainWindow):
         self._send_box_size()
 
     def _send_box_size(self):
+        # Pull live min/max from the config we got from the Jetson; fall back
+        # to safe wide bounds if config hasn't arrived yet.
+        tcfg = self._config.get("tracker", {})
+        mn = int(tcfg.get("box_min", 10))
+        mx = int(tcfg.get("box_max", 400))
         try:
             if self.box_wh_check.isChecked():
-                w = max(10, min(400, int(self.box_w_input.text())))
-                h = max(10, min(400, int(self.box_h_input.text())))
+                w = max(mn, min(mx, int(self.box_w_input.text())))
+                h = max(mn, min(mx, int(self.box_h_input.text())))
                 self.box_w_input.setText(str(w))
                 self.box_h_input.setText(str(h))
                 self._ws_client.send(f"boxsize:{w},{h}")
                 self.ws_response_label.setText(f"Sent: boxsize:{w},{h}")
             else:
-                size = max(10, min(400, int(self.box_input.text())))
+                size = max(mn, min(mx, int(self.box_input.text())))
                 self.box_input.setText(str(size))
                 self._ws_client.send(f"boxsize:{size}")
                 self.ws_response_label.setText(f"Sent: boxsize:{size}")
             self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         except ValueError:
-            self.box_input.setText("20")
-            self.box_w_input.setText("20")
-            self.box_h_input.setText("20")
+            # Restore last known values from cfg
+            bw = tcfg.get("box_w_default", 20)
+            bh = tcfg.get("box_h_default", 20)
+            self.box_input.setText(str(bw))
+            self.box_w_input.setText(str(bw))
+            self.box_h_input.setText(str(bh))
 
     def _on_source_changed(self, index):
         if index < 0:
@@ -679,6 +949,42 @@ class GroundStation(QMainWindow):
             self.det_label.setText(f"Det: {info}")
             self.det_label.setStyleSheet("color: #00cc44; font-size: 11px;")
             return
+        if msg.startswith("status:det_error "):
+            err = msg[len("status:det_error "):]
+            self.det_label.setText(f"Det ERR: {err[:80]}")
+            self.det_label.setStyleSheet("color: #ff3333; font-size: 11px;")
+            return
+        if msg.startswith("status:lost "):
+            reason = msg[len("status:lost "):]
+            self.track_label.setText(f"Lost: {reason}")
+            self.track_label.setStyleSheet("color: #ff8800; font-size: 11px;")
+            return
+        if msg.startswith("config:"):
+            try:
+                cfg = json.loads(msg[7:])
+                self._apply_config_to_ui(cfg)
+            except Exception as e:
+                print(f"[GS] config parse failed: {e}")
+            return
+        if msg.startswith("models:"):
+            try:
+                data = json.loads(msg[7:])
+                models  = data.get("models", [])
+                current = data.get("current", "")
+                self.model_combo.blockSignals(True)
+                self.model_combo.clear()
+                select_idx = 0
+                for i, m in enumerate(models):
+                    self.model_combo.addItem(os.path.basename(m), m)
+                    if m == current:
+                        select_idx = i
+                if not models:
+                    self.model_combo.addItem("(no models found)", "")
+                self.model_combo.setCurrentIndex(select_idx)
+                self.model_combo.blockSignals(False)
+            except Exception as e:
+                print(f"[GS] models parse failed: {e}")
+            return
         if msg.startswith("sources:"):
             data = json.loads(msg[8:])
             current = data.get("current", "")
@@ -705,6 +1011,8 @@ class GroundStation(QMainWindow):
         if "Connected" in status:
             self.ws_status_label.setStyleSheet("color: #00cc44; font-size: 11px;")
             self._ws_client.send("list_sources")
+            self._ws_client.send("list_models")
+            self._ws_client.send("get_config")
         elif "Error" in status or "Disconnected" in status:
             self.ws_status_label.setStyleSheet("color: #ff3333; font-size: 11px;")
         else:

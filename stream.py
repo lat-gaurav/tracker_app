@@ -314,9 +314,15 @@ async def ws_handle(websocket):
                 tracking, t_ms = processor.get_track_info()
                 if tracking:
                     await websocket.send(f"status:tracking {t_ms:.1f}ms")
-                det_on, d_ms, d_count = processor.get_det_info()
+                lost = processor.get_last_lost_reason()
+                if lost:
+                    await websocket.send(f"status:lost {lost}")
+                det_on, d_ms, d_count, d_err = processor.get_det_info()
                 if det_on:
-                    await websocket.send(f"status:detection {d_ms:.1f}ms objects={d_count}")
+                    if d_err:
+                        await websocket.send(f"status:det_error {d_err}")
+                    else:
+                        await websocket.send(f"status:detection {d_ms:.1f}ms objects={d_count}")
         except asyncio.CancelledError:
             pass
 
@@ -347,6 +353,32 @@ async def ws_handle(websocket):
                 on = val in ("on", "1", "true")
                 processor.enable_detector(on)
                 reply = f"Detection {'ON' if on else 'OFF'}"
+
+            elif message == "list_models":
+                from processor import list_models
+                models = list_models()
+                current = processor.get_config().get("model", {}).get("yolo_path", "")
+                reply = f"models:{json.dumps({'models': models, 'current': current})}"
+
+            elif message == "get_config":
+                cfg = processor.get_config()
+                reply = f"config:{json.dumps(cfg)}"
+
+            elif message.startswith("set_param:"):
+                try:
+                    body = message[len("set_param:"):]
+                    path, val = body.split("=", 1)
+                    new_val = processor.set_param(path.strip(), val.strip())
+                    reply = f"Param {path.strip()} = {new_val}"
+                except Exception as e:
+                    reply = f"Error: set_param failed: {e}"
+
+            elif message == "save_default":
+                try:
+                    processor.save_default()
+                    reply = "Saved default config"
+                except Exception as e:
+                    reply = f"Error: save failed: {e}"
 
             elif message == "list_sources":
                 sources = get_available_sources()
