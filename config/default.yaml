@@ -1,0 +1,19 @@
+model: {yolo_path: models/yolov26nobbnew_merged_1024.pt}
+tracker:
+  box_w_default: 40
+  box_h_default: 40
+  box_min: 10
+  box_max: 400
+  acq_assist: {enabled: false, margin: 0.3}
+  ai_assist: {enabled: true, interval: 5, iou_min: 0.1, conf_min: 0.25}
+  ai_acquisition: {enabled: true, near_val: 20}
+  ai_box_size: {enabled: false, class: vehicle}
+camera: {width: 0, height: 0, fps: 0}
+detection:
+  enabled_on_start: true
+  conf_thresh: 0.3
+  top_n: 4
+  vehicle_names: [car, truck, bus, van, motor, motorcycle, bicycle, vehicle]
+  person_names: [person, people, pedestrian]
+jump_detector: {enabled: true, dist_thresh: 0.35, size_thresh: 1.5, iou_thresh: 0.35}
+kalman: {enabled: true, process_noise: 0.01, measure_noise: 0.1}

@@ -1,0 +1,24 @@
+[Unit]
+Description=Tracker App - RTSP Stream + WebSocket Server
+After=network.target
+
+[Service]
+Type=simple
+User=irisnx2
+WorkingDirectory=/home/irisnx2/tracker_app
+ExecStart=/usr/bin/python3 /home/irisnx2/tracker_app/stream.py
+Restart=on-failure
+RestartSec=3
+Environment=DISPLAY=:0
+Environment=HOME=/home/irisnx2
+
+# Give time for nvv4l2h264enc to initialize on stop
+TimeoutStopSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tracker-stream
+
+[Install]
+WantedBy=multi-user.target
