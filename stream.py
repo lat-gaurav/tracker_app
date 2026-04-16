@@ -19,6 +19,7 @@ import yaml
 import websockets
 
 from processor import FrameProcessor
+from visca import VISCACamera
 
 WS_PORT = 5001
 
@@ -32,6 +33,16 @@ FPS       = 30
 
 # Shared state
 processor  = FrameProcessor()
+
+# VISCA camera control (optional — gracefully skips if not connected)
+visca_cam = None
+VISCA_PORT = "/dev/ttyACM0"
+VISCA_BAUD = 9600
+try:
+    visca_cam = VISCACamera(VISCA_PORT, VISCA_BAUD)
+    visca_cam.open()
+except Exception as e:
+    print(f"[VISCA] Camera not available: {e} — camera control disabled")
 _appsrc    = None
 _vflip     = None
 _rotation  = 0            # current videoflip method (0–3)
@@ -58,7 +69,13 @@ def _rec_writer_thread():
     and writes to ffmpeg + overlay file.  Runs until it receives None."""
     global _rec_frame_n
     while True:
-        item = _rec_queue.get()
+        q = _rec_queue
+        if q is None:
+            break
+        try:
+            item = q.get(timeout=0.5)
+        except Exception:
+            continue
         if item is None:
             break
         frame_bytes, overlay_json = item
@@ -116,11 +133,14 @@ def _stop_recording():
     if not _rec_active:
         return
     _rec_active = False
-    # Signal writer thread to exit and drain
+    # Signal writer thread to exit and wait for it to drain
     if _rec_queue:
-        _rec_queue.put(None)
-        time.sleep(0.1)   # let it drain
-        _rec_queue = None
+        try:
+            _rec_queue.put(None, timeout=1)
+        except Exception:
+            pass
+        time.sleep(0.5)   # let writer thread process remaining items + exit
+    _rec_queue = None
     if _rec_proc:
         try:
             _rec_proc.stdin.close()
@@ -191,13 +211,113 @@ def _build_cam_pipeline(device):
     )
 
 
+def _handle_visca(cmd):
+    """Parse and execute a VISCA sub-command. Returns reply string."""
+    parts = cmd.split(":")
+    action = parts[0]
+    arg = int(parts[1]) if len(parts) > 1 else 0
+    try:
+        # Zoom
+        if action == "zoom_tele":       visca_cam.zoom_tele(arg)
+        elif action == "zoom_wide":     visca_cam.zoom_wide(arg)
+        elif action == "zoom_stop":     visca_cam.zoom_stop()
+        elif action == "zoom_direct":   visca_cam.zoom_direct(arg)
+        elif action == "zoom_pos":
+            pos = visca_cam.zoom_position_inq()
+            return f"visca_reply:zoom_pos={pos}"
+        elif action == "dzoom_on":      visca_cam.dzoom_on()
+        elif action == "dzoom_off":     visca_cam.dzoom_off()
+        # Focus
+        elif action == "focus_auto":    visca_cam.focus_auto()
+        elif action == "focus_manual":  visca_cam.focus_manual()
+        elif action == "focus_far":     visca_cam.focus_far(arg)
+        elif action == "focus_near":    visca_cam.focus_near(arg)
+        elif action == "focus_stop":    visca_cam.focus_stop()
+        elif action == "focus_one_push": visca_cam.focus_one_push()
+        elif action == "focus_direct":  visca_cam.focus_direct(arg)
+        elif action == "focus_pos":
+            pos = visca_cam.focus_position_inq()
+            return f"visca_reply:focus_pos={pos}"
+        # Exposure
+        elif action == "ae_auto":       visca_cam.ae_full_auto()
+        elif action == "ae_manual":     visca_cam.ae_manual()
+        elif action == "ae_shutter":    visca_cam.ae_shutter_priority()
+        elif action == "ae_iris":       visca_cam.ae_iris_priority()
+        elif action == "shutter":       visca_cam.shutter_direct(arg)
+        elif action == "iris":          visca_cam.iris_direct(arg)
+        elif action == "gain":          visca_cam.gain_direct(arg)
+        elif action == "exp_comp_on":   visca_cam.exp_comp_on()
+        elif action == "exp_comp_off":  visca_cam.exp_comp_off()
+        elif action == "exp_comp":      visca_cam.exp_comp_direct(arg)
+        elif action == "backlight_on":  visca_cam.backlight_on()
+        elif action == "backlight_off": visca_cam.backlight_off()
+        # White balance
+        elif action == "wb_auto":       visca_cam.wb_auto()
+        elif action == "wb_indoor":     visca_cam.wb_indoor()
+        elif action == "wb_outdoor":    visca_cam.wb_outdoor()
+        elif action == "wb_atw":        visca_cam.wb_atw()
+        elif action == "wb_manual":     visca_cam.wb_manual()
+        elif action == "wb_one_push":   visca_cam.wb_one_push_trigger()
+        elif action == "rgain":         visca_cam.rgain_direct(arg)
+        elif action == "bgain":         visca_cam.bgain_direct(arg)
+        # Image processing
+        elif action == "stabilizer_on":   visca_cam.stabilizer_on()
+        elif action == "stabilizer_off":  visca_cam.stabilizer_off()
+        elif action == "stabilizer_hold": visca_cam.stabilizer_hold()
+        elif action == "wdr_on":        visca_cam.wdr_on()
+        elif action == "wdr_off":       visca_cam.wdr_off()
+        elif action == "ve_on":         visca_cam.ve_on()
+        elif action == "defog_on":      visca_cam.defog_on(arg)
+        elif action == "defog_off":     visca_cam.defog_off()
+        elif action == "nr":            visca_cam.nr_direct(arg)
+        elif action == "aperture":      visca_cam.aperture_direct(arg)
+        elif action == "high_sens_on":  visca_cam.high_sensitivity_on()
+        elif action == "high_sens_off": visca_cam.high_sensitivity_off()
+        # ICR (day/night)
+        elif action == "icr_on":        visca_cam.icr_on()
+        elif action == "icr_off":       visca_cam.icr_off()
+        elif action == "auto_icr_on":   visca_cam.auto_icr_on()
+        elif action == "auto_icr_off":  visca_cam.auto_icr_off()
+        # Other
+        elif action == "flip_on":       visca_cam.picture_flip_on()
+        elif action == "flip_off":      visca_cam.picture_flip_off()
+        elif action == "mirror_on":     visca_cam.lr_reverse_on()
+        elif action == "mirror_off":    visca_cam.lr_reverse_off()
+        elif action == "freeze_on":     visca_cam.freeze_on()
+        elif action == "freeze_off":    visca_cam.freeze_off()
+        elif action == "bw_on":         visca_cam.bw_on()
+        elif action == "bw_off":        visca_cam.bw_off()
+        # Presets
+        elif action == "preset_save":   visca_cam.memory_set(arg)
+        elif action == "preset_recall": visca_cam.memory_recall(arg)
+        elif action == "preset_reset":  visca_cam.memory_reset(arg)
+        # System
+        elif action == "lens_init":     visca_cam.lens_init()
+        elif action == "cam_reset":     visca_cam.camera_reset()
+        elif action == "power_on":      visca_cam.power_on()
+        elif action == "power_off":     visca_cam.power_off()
+        else:
+            return f"Error: unknown VISCA command: {action}"
+        return f"VISCA OK: {action}"
+    except Exception as e:
+        return f"VISCA Error: {e}"
+
+
 def check_device(device):
-    if not os.path.exists(device):
-        available = [f"/dev/{d}" for d in os.listdir("/dev") if d.startswith("video")]
-        print(f"[ERROR] Camera device {device} not found!")
-        print(f"[INFO]  Available video devices: {sorted(available)}")
-        sys.exit(1)
-    print(f"[OK]    Camera device {device} found.")
+    """Check if the default camera exists.  If not, try to fall back to the
+    first available /dev/video* device instead of exiting."""
+    global DEVICE
+    if os.path.exists(device):
+        print(f"[OK]    Camera device {device} found.")
+        return
+    available = sorted([f"/dev/{d}" for d in os.listdir("/dev") if d.startswith("video")])
+    print(f"[WARN]  Default camera {device} not found.")
+    print(f"[INFO]  Available video devices: {available}")
+    if available:
+        DEVICE = available[0]
+        print(f"[INFO]  Falling back to {DEVICE}")
+    else:
+        print(f"[WARN]  No cameras found — start anyway; select a source from ground.")
 
 
 # ------------------------------------------------------------------ coord conversion
@@ -243,11 +363,20 @@ def capture_and_push():
         global _cap_pipe
         _stop()
         if source.startswith("/dev/video"):
-            _cap_pipe = Gst.parse_launch(_build_cam_pipeline(source))
-            gst_sink = _cap_pipe.get_by_name('sink')
-            _cap_pipe.set_state(Gst.State.PLAYING)
+            if not os.path.exists(source):
+                print(f"[CAP]   Device {source} not found — waiting for source change from ground")
+                return
+            try:
+                _cap_pipe = Gst.parse_launch(_build_cam_pipeline(source))
+                gst_sink = _cap_pipe.get_by_name('sink')
+                _cap_pipe.set_state(Gst.State.PLAYING)
+            except Exception as e:
+                print(f"[CAP]   Camera pipeline failed: {e}")
+                _cap_pipe = None
+                gst_sink = None
+                return
             cap_cv = None
-            print(f"[CAP]   Camera started: {source} (auto-negotiate resolution)")
+            print(f"[CAP]   Camera started: {source}")
         else:
             cap_cv = cv2.VideoCapture(source)
             if not cap_cv.isOpened():
@@ -626,6 +755,12 @@ async def ws_handle(websocket):
                     reply = f"Click set at ({ox:.3f}, {oy:.3f}) [original space]"
                 except (ValueError, IndexError):
                     reply = "Error: invalid click command"
+
+            elif message.startswith("visca:"):
+                if visca_cam is None or not visca_cam.is_open:
+                    reply = "Error: VISCA camera not connected"
+                else:
+                    reply = _handle_visca(message[6:])
 
             elif message == "record:start":
                 _start_recording()

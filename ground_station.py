@@ -1,5 +1,20 @@
 #  QT_QPA_PLATFORM=xcb python3 ground_station.py
 
+
+# echo '
+# # Ground station environment
+# export GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0
+# export QT_QPA_PLATFORM=xcb
+# ' >> ~/.bashrc
+
+# source ~/.bashrc
+
+# cd ~/tracker_app && python3 ground_station.py 2>&1 | grep -v "gst-plugin-scanner\|GStreamer-WARNING\|GStreamer-CRITICAL\|GLib-\|wl_buffer\|queue.*destroyed\|cannot register"
+
+
+
+
+
 import sys
 import os
 import threading
@@ -22,7 +37,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox,
     QSizePolicy, QCheckBox, QTabWidget, QFormLayout, QGridLayout, QFrame,
-    QMessageBox
+    QMessageBox, QSlider, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont
@@ -347,6 +362,7 @@ class GroundStation(QMainWindow):
         self.config_tabs = QTabWidget()
         self.config_tabs.addTab(self._build_tracker_tab(),   "Tracker")
         self.config_tabs.addTab(self._build_detection_tab(), "Detection")
+        self.config_tabs.addTab(self._build_camera_tab(),    "Camera")
         self.config_tabs.addTab(self._build_advanced_tab(),  "Advanced")
         self._config_panel_layout.addWidget(self.config_tabs, 1)
 
@@ -778,6 +794,182 @@ class GroundStation(QMainWindow):
         if path:
             self._set_param("model.yolo_path", path)
 
+    def _visca(self, cmd):
+        """Send a VISCA command via WebSocket."""
+        self._ws_client.send(f"visca:{cmd}")
+        self.ws_response_label.setText(f"Sent: visca:{cmd}")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
+    def _build_camera_tab(self):
+        """Sony FCB-EV9520L VISCA camera control tab."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QFormLayout(inner)
+        form.setContentsMargins(8, 6, 8, 6)
+        form.setSpacing(4)
+
+        # ---- Zoom ----
+        form.addRow(self._section_header("Zoom"))
+        # Slider: Wide (0) ←→ Tele (16384)
+        zs = QHBoxLayout()
+        zs.addWidget(QLabel("W"))
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(0, 16384)
+        self._zoom_slider.setValue(0)
+        self._zoom_slider.sliderReleased.connect(
+            lambda: self._visca(f"zoom_direct:{self._zoom_slider.value()}"))
+        self._zoom_lbl = QLabel("0")
+        self._zoom_lbl.setFixedWidth(40)
+        self._zoom_slider.valueChanged.connect(
+            lambda v: self._zoom_lbl.setText(str(v)))
+        zs.addWidget(self._zoom_slider, 1)
+        zs.addWidget(QLabel("T"))
+        zs.addWidget(self._zoom_lbl)
+        form.addRow(zs)
+
+        zb = QHBoxLayout()
+        b = QPushButton("W"); b.setFixedWidth(30)
+        b.pressed.connect(lambda: self._visca("zoom_wide:5"))
+        b.released.connect(lambda: self._visca("zoom_stop"))
+        zb.addWidget(b)
+        for label, pos in [("1x",0),("5x",3000),("10x",6000),
+                           ("15x",9000),("20x",12000),("30x",16384)]:
+            b = QPushButton(label); b.setFixedWidth(32)
+            b.clicked.connect(lambda _, p=pos: (
+                self._visca(f"zoom_direct:{p}"),
+                self._zoom_slider.setValue(p)))
+            zb.addWidget(b)
+        b = QPushButton("T"); b.setFixedWidth(30)
+        b.pressed.connect(lambda: self._visca("zoom_tele:5"))
+        b.released.connect(lambda: self._visca("zoom_stop"))
+        zb.addWidget(b)
+        b = QPushButton("D-Zm"); b.setFixedWidth(40); b.setCheckable(True)
+        b.toggled.connect(lambda on: self._visca("dzoom_on" if on else "dzoom_off"))
+        zb.addWidget(b)
+        form.addRow(zb)
+
+        # ---- Focus ----
+        form.addRow(self._section_header("Focus"))
+        fr = QHBoxLayout()
+        for lbl, cmd in [("AF","focus_auto"),("MF","focus_manual"),("1-Push","focus_one_push")]:
+            b = QPushButton(lbl); b.setFixedWidth(50)
+            b.clicked.connect(lambda _,c=cmd: self._visca(c))
+            fr.addWidget(b)
+        fr.addSpacing(8)
+        b = QPushButton("Near"); b.setFixedWidth(42)
+        b.pressed.connect(lambda: self._visca("focus_near:4"))
+        b.released.connect(lambda: self._visca("focus_stop"))
+        fr.addWidget(b)
+        b = QPushButton("Far"); b.setFixedWidth(42)
+        b.pressed.connect(lambda: self._visca("focus_far:4"))
+        b.released.connect(lambda: self._visca("focus_stop"))
+        fr.addWidget(b)
+        fr.addStretch()
+        form.addRow(fr)
+
+        # ---- Exposure ----
+        form.addRow(self._section_header("Exposure"))
+        er = QHBoxLayout()
+        for lbl, cmd in [("Auto","ae_auto"),("Shtr","ae_shutter"),
+                         ("Iris","ae_iris"),("Man","ae_manual")]:
+            b = QPushButton(lbl); b.setFixedWidth(42)
+            b.clicked.connect(lambda _,c=cmd: self._visca(c))
+            er.addWidget(b)
+        er.addSpacing(6)
+        b = QPushButton("BL+"); b.setFixedWidth(32)
+        b.clicked.connect(lambda: self._visca("backlight_on"))
+        er.addWidget(b)
+        b = QPushButton("BL-"); b.setFixedWidth(32)
+        b.clicked.connect(lambda: self._visca("backlight_off"))
+        er.addWidget(b)
+        er.addStretch()
+        form.addRow(er)
+
+        # ---- White Balance ----
+        form.addRow(self._section_header("White Balance"))
+        wr = QHBoxLayout()
+        for lbl, cmd in [("Auto","wb_auto"),("In","wb_indoor"),("Out","wb_outdoor"),
+                         ("ATW","wb_atw"),("1P","wb_one_push")]:
+            b = QPushButton(lbl); b.setFixedWidth(38)
+            b.clicked.connect(lambda _,c=cmd: self._visca(c))
+            wr.addWidget(b)
+        wr.addStretch()
+        form.addRow(wr)
+
+        # ---- Image ----
+        form.addRow(self._section_header("Image"))
+        ig = QGridLayout(); ig.setSpacing(3)
+        for lbl, cmd, r, c in [
+            ("Stab ON","stabilizer_on",0,0), ("Stab OFF","stabilizer_off",0,1),
+            ("WDR ON","wdr_on",0,2), ("WDR OFF","wdr_off",0,3),
+            ("VE ON","ve_on",1,0), ("Defog Lo","defog_on:1",1,1),
+            ("Defog Hi","defog_on:3",1,2), ("Defog OFF","defog_off",1,3),
+            ("HiSens+","high_sens_on",2,0), ("HiSens-","high_sens_off",2,1),
+        ]:
+            b = QPushButton(lbl); b.setFixedHeight(24)
+            b.clicked.connect(lambda _,cm=cmd: self._visca(cm))
+            ig.addWidget(b, r, c)
+        form.addRow(ig)
+
+        # NR + Aperture sliders
+        sl = QHBoxLayout()
+        sl.addWidget(QLabel("NR"))
+        ns = QSlider(Qt.Orientation.Horizontal); ns.setRange(0,5); ns.setValue(2)
+        nl = QLabel("2"); nl.setFixedWidth(15)
+        ns.valueChanged.connect(lambda v: (nl.setText(str(v)), self._visca(f"nr:{v}")))
+        sl.addWidget(ns); sl.addWidget(nl)
+        sl.addSpacing(8)
+        sl.addWidget(QLabel("Apt"))
+        ap = QSlider(Qt.Orientation.Horizontal); ap.setRange(0,15); ap.setValue(8)
+        al = QLabel("8"); al.setFixedWidth(15)
+        ap.valueChanged.connect(lambda v: (al.setText(str(v)), self._visca(f"aperture:{v}")))
+        sl.addWidget(ap); sl.addWidget(al)
+        form.addRow(sl)
+
+        # ---- Day/Night ----
+        form.addRow(self._section_header("Day / Night"))
+        dr = QHBoxLayout()
+        for lbl, cmd in [("Auto ICR","auto_icr_on"),("ICR OFF","auto_icr_off"),
+                         ("Night","icr_on"),("Day","icr_off")]:
+            b = QPushButton(lbl); b.setFixedWidth(58)
+            b.clicked.connect(lambda _,c=cmd: self._visca(c))
+            dr.addWidget(b)
+        dr.addStretch()
+        form.addRow(dr)
+
+        # ---- Other ----
+        form.addRow(self._section_header("Other"))
+        og = QGridLayout(); og.setSpacing(3)
+        for lbl, cmd, r, c in [
+            ("Flip ON","flip_on",0,0), ("Flip OFF","flip_off",0,1),
+            ("Mirror+","mirror_on",0,2), ("Mirror-","mirror_off",0,3),
+            ("B&W","bw_on",1,0), ("Color","bw_off",1,1),
+            ("Freeze","freeze_on",1,2), ("Unfreeze","freeze_off",1,3),
+            ("Lens Init","lens_init",2,0), ("Reset","cam_reset",2,1),
+        ]:
+            b = QPushButton(lbl); b.setFixedHeight(24)
+            b.clicked.connect(lambda _,cm=cmd: self._visca(cm))
+            og.addWidget(b, r, c)
+        form.addRow(og)
+
+        # ---- Presets ----
+        form.addRow(self._section_header("Presets"))
+        pr = QHBoxLayout()
+        self._preset_spin = QLineEdit("0"); self._preset_spin.setFixedWidth(25)
+        self._preset_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pr.addWidget(self._preset_spin)
+        for lbl, pfx in [("Save","preset_save"),("Recall","preset_recall"),("Rst","preset_reset")]:
+            b = QPushButton(lbl); b.setFixedWidth(48)
+            b.clicked.connect(lambda _,cp=pfx: self._visca(
+                f"{cp}:{int(self._preset_spin.text())&0xF}"))
+            pr.addWidget(b)
+        pr.addStretch()
+        form.addRow(pr)
+
+        scroll.setWidget(inner)
+        return scroll
+
     def _build_advanced_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -1001,6 +1193,11 @@ class GroundStation(QMainWindow):
         self.cmd_input.clear()
 
     def _on_ws_message(self, msg):
+        if msg.startswith("visca_reply:") or msg.startswith("VISCA OK:") or msg.startswith("VISCA Error:"):
+            self.ws_response_label.setText(f"Camera: {msg}")
+            color = "#00cc44" if "OK" in msg or "reply" in msg else "#ff3333"
+            self.ws_response_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            return
         if msg.startswith("status:tracking "):
             info = msg[len("status:tracking "):]
             self.track_label.setText(f"Track: {info}")
