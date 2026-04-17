@@ -4,6 +4,7 @@ import yaml
 import numpy as np
 import threading
 import time
+from collections import OrderedDict
 
 
 CONFIG_PATH = "config/default.yaml"
@@ -15,6 +16,7 @@ DEFAULT_CONFIG = {
         "yolo_path": "models/yolov26nobbnew_merged_1024.engine",
     },
     "tracker": {
+        "type": "csrt-fast",    # "csrt", "csrt-fast", "csrt-faster", "csrt-ultra", "kcf", or "mosse"
         "box_w_default": 20,
         "box_h_default": 20,
         "box_min": 10,
@@ -138,14 +140,61 @@ def _set_nested(d, dotted_path, value):
         raise ValueError(f"Bad value for {dotted_path}: {value!r} ({e})")
 
 
-# ------------------------------------------------------------------ CSRT factory
+# ------------------------------------------------------------------ tracker factory
 
-def _create_tracker():
-    if hasattr(cv2, "TrackerCSRT_create"):
-        return cv2.TrackerCSRT_create()
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
-        return cv2.legacy.TrackerCSRT_create()
-    raise RuntimeError("CSRT tracker not available — install opencv-contrib-python")
+# CSRT speed presets — tuned parameters that trade features for speed.
+def _csrt_params(preset="default"):
+    p = cv2.TrackerCSRT_Params()
+    if preset == "fast":
+        p.template_size = 100
+        p.use_color_names = False
+        p.use_segmentation = False
+        p.number_of_scales = 17
+        p.admm_iterations = 2
+    elif preset == "faster":
+        p.template_size = 80
+        p.use_color_names = False
+        p.use_gray = False
+        p.use_segmentation = False
+        p.number_of_scales = 9
+        p.admm_iterations = 2
+        p.num_hog_channels_used = 9
+    elif preset == "ultra":
+        p.template_size = 50
+        p.use_color_names = False
+        p.use_gray = False
+        p.use_segmentation = False
+        p.use_channel_weights = False
+        p.number_of_scales = 5
+        p.admm_iterations = 1
+        p.num_hog_channels_used = 4
+    return p
+
+TRACKER_TYPES = [
+    "csrt", "csrt-fast", "csrt-faster", "csrt-ultra", "kcf", "mosse",
+]
+
+def _create_tracker(tracker_type="csrt"):
+    tracker_type = tracker_type.lower()
+    if tracker_type.startswith("csrt"):
+        preset = tracker_type.split("-", 1)[1] if "-" in tracker_type else "default"
+        params = _csrt_params(preset)
+        if hasattr(cv2, "TrackerCSRT_create"):
+            return cv2.TrackerCSRT_create(params)
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+            return cv2.legacy.TrackerCSRT_create(params)
+        raise RuntimeError("CSRT not available")
+    if tracker_type == "kcf":
+        if hasattr(cv2, "TrackerKCF_create"):
+            return cv2.TrackerKCF_create()
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+            return cv2.legacy.TrackerKCF_create()
+        raise RuntimeError("KCF not available")
+    if tracker_type == "mosse":
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
+            return cv2.legacy.TrackerMOSSE_create()
+        raise RuntimeError("MOSSE not available")
+    raise ValueError(f"Unknown tracker type {tracker_type!r}. Choose from: {TRACKER_TYPES}")
 
 
 # ------------------------------------------------------------------ SORT Kalman
@@ -187,11 +236,22 @@ class SORTKalman:
         self.P = np.eye(7) * 10.0
         self.initialized = True
 
-    def predict(self):
+    def predict(self, steps=1):
         if not self.initialized:
             return None
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
+        steps = max(1, int(steps))
+        if steps == 1:
+            self.x = self.F @ self.x
+            self.P = self.F @ self.P @ self.F.T + self.Q
+        else:
+            F_n = np.linalg.matrix_power(self.F, steps)
+            self.x = F_n @ self.x
+            Q_acc = np.zeros_like(self.Q)
+            F_k = np.eye(7)
+            for _ in range(steps):
+                Q_acc += F_k @ self.Q @ F_k.T
+                F_k = F_k @ self.F
+            self.P = F_n @ self.P @ F_n.T + Q_acc
         return self._state_to_bbox(self.x)
 
     def update(self, bbox):
@@ -237,13 +297,13 @@ class JumpDetector:
         else:
             self.kalman = None
 
-    def check(self, bbox):
+    def check(self, bbox, frames_skipped=1):
         """Returns (is_jump, metrics_dict_or_None).  Updates Kalman only if not a jump."""
         if self.kalman is None or not self.cfg["jump_detector"]["enabled"]:
             if self.kalman:
                 self.kalman.update(bbox)
             return False, None
-        pred = self.kalman.predict()
+        pred = self.kalman.predict(steps=frames_skipped)
         if pred is None:
             self.kalman.update(bbox)
             return False, None
@@ -288,18 +348,31 @@ class FrameProcessor:
     the latest frame when ready.  Slow consumers just skip intermediate frames.
     """
 
+    FRAME_RING_SIZE = 300
+    MAX_DET_AGE = 4
+    _CATCHUP_DISPLAY_INTERVAL = 5
+
     def __init__(self):
         self._lock = threading.Lock()
 
         # Config (live-updatable)
         self.cfg = load_config()
 
+        # ---- Frame sequencing ----
+        self._frame_seq = 0
+        self._frame_ring = OrderedDict()
+        self._frame_ts = {}
+
         # Tracker state
         self._tracker_frame = None
+        self._tracker_frame_seq = 0
         self._pending_click = None
+        self._pending_click_seq = 0
+        self._pending_drag_rect = None
         self._box_w         = self.cfg["tracker"]["box_w_default"]
         self._box_h         = self.cfg["tracker"]["box_h_default"]
         self._bbox          = None
+        self._bbox_seq      = 0
         self._track_ms      = 0.0
         self._track_count   = 0
         self._jump          = JumpDetector(self.cfg)
@@ -307,11 +380,23 @@ class FrameProcessor:
         self._ai_assist_until_count = 0   # show triangle while track_count < this
         self._pending_resize = False      # resize active tracker to new _box_w/_box_h
 
+        # Pause-and-select state
+        self._paused = False
+        self._paused_seq = 0
+        self._catching_up = False
+        self._paused_frame = None
+        self._paused_bbox = None
+        self._paused_detections = []
+        self._paused_ai_active = False
+        self._catchup_frame = None
+
         # Detector state
         self._detector_frame   = None
+        self._detector_frame_seq = 0
         self._detector_enabled = bool(self.cfg.get("detection", {}).get("enabled_on_start", False))
         self._detections       = []   # shown on screen (>= detection.conf_thresh)
         self._detections_assist = []  # wider set for AI-assist matching only
+        self._det_seq          = 0
         self._det_ms           = 0.0
         self._det_count        = 0
         self._yolo_model       = None
@@ -333,16 +418,31 @@ class FrameProcessor:
 
     def submit_frame(self, frame: np.ndarray):
         copy = frame.copy()
+        now = time.monotonic()
         with self._lock:
+            self._frame_seq += 1
+            seq = self._frame_seq
+            self._frame_ring[seq] = copy
+            self._frame_ts[seq] = now
+            while len(self._frame_ring) > self.FRAME_RING_SIZE:
+                old_seq, _ = self._frame_ring.popitem(last=False)
+                self._frame_ts.pop(old_seq, None)
             self._tracker_frame = copy
-            if self._detector_enabled:
+            self._tracker_frame_seq = seq
+            if self._detector_enabled and not self._paused:
                 self._detector_frame = copy
+                self._detector_frame_seq = seq
 
-    def draw(self, frame: np.ndarray) -> np.ndarray:
+    def draw(self, frame: np.ndarray, paused_view: bool = False) -> np.ndarray:
         with self._lock:
-            bbox       = self._bbox
-            detections = self._detections
-            ai_active  = self._track_count < self._ai_assist_until_count
+            if paused_view and self._paused:
+                bbox       = self._paused_bbox
+                detections = self._paused_detections
+                ai_active  = self._paused_ai_active
+            else:
+                bbox       = self._bbox
+                detections = self._detections
+                ai_active  = self._track_count < self._ai_assist_until_count
         for det in detections:
             frame = self._draw_detection(frame, det)
         if bbox is not None:
@@ -354,7 +454,26 @@ class FrameProcessor:
     def set_click(self, ox: float, oy: float):
         with self._lock:
             self._pending_click = (ox, oy)
-        print(f"[PROC]  set_click({ox:.3f}, {oy:.3f})")
+            if self._paused and self._paused_seq > 0:
+                self._pending_click_seq = self._paused_seq
+            else:
+                self._pending_click_seq = self._frame_seq
+        print(f"[PROC]  set_click({ox:.3f}, {oy:.3f}) "
+              f"click_seq={self._pending_click_seq} "
+              f"{'(paused)' if self._paused else '(live)'}")
+
+    def set_drag(self, nx: float, ny: float, nw: float, nh: float):
+        ocx = nx + nw / 2.0
+        ocy = ny + nh / 2.0
+        with self._lock:
+            self._pending_click = (ocx, ocy)
+            self._pending_drag_rect = (nx, ny, nw, nh)
+            if self._paused and self._paused_seq > 0:
+                self._pending_click_seq = self._paused_seq
+            else:
+                self._pending_click_seq = self._frame_seq
+        print(f"[PROC]  set_drag({nx:.3f},{ny:.3f},{nw:.3f},{nh:.3f}) "
+              f"click_seq={self._pending_click_seq}")
 
     def set_box_size(self, w: int, h: int = None):
         if h is None:
@@ -376,8 +495,43 @@ class FrameProcessor:
         with self._lock:
             self._pending_click = "clear"
             self._bbox = None
+            self._bbox_seq = 0
             self._track_ms = 0.0
         print("[PROC]  clear_track()")
+
+    def pause(self):
+        with self._lock:
+            self._paused = True
+            self._paused_seq = self._frame_seq
+            self._paused_frame = self._frame_ring.get(self._frame_seq)
+            self._paused_bbox = self._bbox
+            self._paused_detections = list(self._detections)
+            self._paused_ai_active = self._track_count < self._ai_assist_until_count
+        print(f"[PROC]  PAUSED at seq={self._paused_seq}")
+
+    def resume(self):
+        with self._lock:
+            self._paused = False
+            self._paused_seq = 0
+            self._paused_frame = None
+            self._catching_up = False
+        print("[PROC]  RESUMED")
+
+    def is_paused(self):
+        with self._lock:
+            return self._paused, self._paused_seq, self._catching_up
+
+    def get_display_state(self):
+        with self._lock:
+            return (self._paused, self._catching_up, self._paused_frame, self._catchup_frame)
+
+    def get_paused_frame(self):
+        with self._lock:
+            return self._paused_frame
+
+    def get_catchup_frame(self):
+        with self._lock:
+            return self._catchup_frame
 
     def enable_detector(self, on: bool):
         with self._lock:
@@ -385,6 +539,7 @@ class FrameProcessor:
             if not on:
                 self._detections = []
                 self._detections_assist = []
+                self._det_seq = 0
                 self._det_ms = 0.0
                 self._detector_frame = None
         print(f"[PROC]  detector {'ENABLED' if on else 'disabled'}")
@@ -435,6 +590,16 @@ class FrameProcessor:
 
             # 3. If box_min/box_max change, re-clamp current _box_w/_box_h and
             #    propagate any clamp to the active tracker too.
+            if dotted_path == "tracker.type":
+                val = str(cur).lower()
+                if val not in TRACKER_TYPES:
+                    raise ValueError(f"Unknown tracker type {val!r}. Choose from: {TRACKER_TYPES}")
+                self.cfg["tracker"]["type"] = val
+                cur = val
+                if self._bbox is not None:
+                    self._pending_resize = True
+                print(f"[CONFIG] tracker type -> {val}" + (" [reinit pending]" if self._bbox else ""))
+
             if dotted_path in ("tracker.box_min", "tracker.box_max"):
                 new_w = max(mn, min(mx, self._box_w))
                 new_h = max(mn, min(mx, self._box_h))
@@ -475,23 +640,106 @@ class FrameProcessor:
             self._last_lost_reason = ""
             return r
 
+    # ---------------- catch-up replay ----------------
+
+    def _catch_up_to_live(self, tracker, from_seq):
+        with self._lock:
+            self._catching_up = True
+            live_seq = self._frame_seq
+            replay_frames = [(s, self._frame_ring[s])
+                             for s in sorted(self._frame_ring)
+                             if from_seq < s <= live_seq]
+
+        total = len(replay_frames)
+        print(f"[CATCHUP] start: {total} frames  from_seq={from_seq} live_seq={live_seq}")
+
+        processed = 0
+        last_seq = from_seq
+
+        for seq, frame in replay_frames:
+            if processed % 8 == 0:
+                with self._lock:
+                    if self._pending_click is not None:
+                        print(f"[CATCHUP] ABORTED at seq={seq}")
+                        self._catching_up = False
+                        self._catchup_frame = None
+                        return tracker, True
+
+            success, bbox = tracker.update(frame)
+
+            if not success:
+                print(f"[CATCHUP] LOST at seq={seq} ({processed}/{total})")
+                self._jump.reset()
+                with self._lock:
+                    self._bbox = None
+                    self._bbox_seq = 0
+                    self._track_ms = 0.0
+                    self._last_lost_reason = "lost during catch-up"
+                    self._catching_up = False
+                    self._catchup_frame = None
+                return None, False
+
+            frames_skipped = seq - last_seq
+            is_jump, metrics = self._jump.check(bbox, frames_skipped)
+            if is_jump:
+                reason = f"jump during catch-up seq={seq} dist={metrics['dist_ratio']:.2f}"
+                print(f"[CATCHUP] JUMP — {reason}")
+                self._jump.reset()
+                with self._lock:
+                    self._bbox = None
+                    self._bbox_seq = 0
+                    self._track_ms = 0.0
+                    self._last_lost_reason = reason
+                    self._catching_up = False
+                    self._catchup_frame = None
+                return None, False
+
+            processed += 1
+            last_seq = seq
+
+            if processed % self._CATCHUP_DISPLAY_INTERVAL == 0 or processed == total:
+                with self._lock:
+                    self._bbox = tuple(int(v) for v in bbox)
+                    self._bbox_seq = seq
+                    self._catchup_frame = frame
+            else:
+                with self._lock:
+                    self._bbox = tuple(int(v) for v in bbox)
+                    self._bbox_seq = seq
+
+        with self._lock:
+            self._catching_up = False
+            self._catchup_frame = None
+            cur_live = self._frame_seq
+        print(f"[CATCHUP] DONE: {processed}/{total} frames  "
+              f"seq {from_seq}->{live_seq}  gap_to_live={cur_live - last_seq}")
+        return tracker, True
+
     # ---------------- tracker thread ----------------
 
     def _tracker_loop(self):
         tracker = None
+        last_track_time = None
+        last_track_seq = 0
 
         while True:
             with self._lock:
                 frame = self._tracker_frame
+                frame_seq = self._tracker_frame_seq
                 self._tracker_frame = None
 
             if frame is None:
                 time.sleep(0.005)
                 continue
 
+            now = time.monotonic()
+
             with self._lock:
                 pending = self._pending_click
+                click_seq = self._pending_click_seq
+                drag_rect = self._pending_drag_rect
                 self._pending_click = None
+                self._pending_drag_rect = None
                 bw = self._box_w
                 bh = self._box_h
                 resize_now = self._pending_resize
@@ -502,9 +750,10 @@ class FrameProcessor:
             if pending == "clear":
                 tracker = None
                 self._jump.reset()
+                last_track_time = None
+                last_track_seq = 0
                 continue
 
-            # Live resize: keep current centre, swap to new W×H, reinit tracker
             if resize_now and tracker is not None and self._bbox is not None:
                 bx, by, bw_old, bh_old = self._bbox
                 cx_old = bx + bw_old / 2.0
@@ -512,70 +761,125 @@ class FrameProcessor:
                 nx = max(0, min(int(cx_old - bw / 2), w - bw))
                 ny = max(0, min(int(cy_old - bh / 2), h - bh))
                 new_bbox = (nx, ny, bw, bh)
-                tracker = _create_tracker()
+                ttype = self.cfg["tracker"]["type"]
+                tracker = _create_tracker(ttype)
                 tracker.init(frame, new_bbox)
                 self._jump.init_tracker(new_bbox)
                 with self._lock:
                     self._bbox = new_bbox
-                print(f"[PROC]  live resize: {(bx,by,bw_old,bh_old)} -> {new_bbox}")
+                    self._bbox_seq = frame_seq
+                last_track_time = now
+                last_track_seq = frame_seq
+                print(f"[PROC]  live resize -> {new_bbox}")
 
-            if pending is not None:
+            if pending is not None and pending != "clear":
                 ox, oy = pending
-                cx = int(ox * w)
-                cy = int(oy * h)
 
-                # AI box-size estimation: use median detection size for chosen class
-                ai_bs = self.cfg["tracker"].get("ai_box_size", {})
-                if ai_bs.get("enabled", False):
-                    cls = str(ai_bs.get("class", "vehicle")).lower()
-                    auto = self._get_auto_box_size(cls)
-                    if auto is not None:
-                        bw, bh = auto
-                        with self._lock:
-                            self._box_w = bw
-                            self._box_h = bh
-                            self.cfg["tracker"]["box_w_default"] = bw
-                            self.cfg["tracker"]["box_h_default"] = bh
-                            self._auto_box_notify = (bw, bh)
-                        print(f"[PROC]  ai_box_size: median {cls} size -> {bw}x{bh}")
+                # Click-to-frame lookup
+                init_frame = frame
+                init_seq = frame_seq
+                with self._lock:
+                    if click_seq in self._frame_ring:
+                        init_frame = self._frame_ring[click_seq]
+                        init_seq = click_seq
+                    elif self._frame_ring:
+                        oldest_seq = next(iter(self._frame_ring))
+                        if oldest_seq > click_seq:
+                            init_frame = self._frame_ring[oldest_seq]
+                            init_seq = oldest_seq
 
-                # Precedence on init:
-                #   1. AI Acquisition — snap to nearest YOLO detection (if enabled + in range)
-                #   2. Acquisition Assist — refine raw bbox to dominant corner cluster (if enabled)
-                #   3. Raw click bbox using current _box_w/_box_h
-                bbox = None
-                init_path = "raw"
-                ai_acq = self.cfg["tracker"].get("ai_acquisition", {})
-                if ai_acq.get("enabled", False):
-                    snapped = self._ai_acquisition_snap(
-                        cx, cy, float(ai_acq.get("near_val", 150)))
-                    if snapped is not None:
-                        bbox = snapped
-                        init_path = "ai_acquisition"
+                ih, iw = init_frame.shape[:2]
 
-                if bbox is None:
-                    x = max(0, min(cx - bw // 2, w - bw))
-                    y = max(0, min(cy - bh // 2, h - bh))
-                    raw_bbox = (x, y, bw, bh)
-                    acq = self.cfg["tracker"].get("acq_assist", {})
-                    if acq.get("enabled", False):
-                        margin = float(acq.get("margin", 0.30))
-                        refined = self._acq_assist_refine(frame, raw_bbox, margin)
-                        if refined is not None:
-                            bbox = refined
-                            init_path = "acq_assist"
+                if drag_rect is not None:
+                    dnx, dny, dnw, dnh = drag_rect
+                    dx = max(0, int(dnx * iw))
+                    dy = max(0, int(dny * ih))
+                    dw = max(1, min(int(dnw * iw), iw - dx))
+                    dh = max(1, min(int(dnh * ih), ih - dy))
+                    bbox = (dx, dy, dw, dh)
+                    init_path = "drag"
+                    cx = dx + dw // 2
+                    cy = dy + dh // 2
+                else:
+                    cx = int(ox * iw)
+                    cy = int(oy * ih)
+                    bbox = None
+                    init_path = "raw"
+
+                    ai_bs = self.cfg["tracker"].get("ai_box_size", {})
+                    if ai_bs.get("enabled", False):
+                        cls = str(ai_bs.get("class", "vehicle")).lower()
+                        auto = self._get_auto_box_size(cls)
+                        if auto is not None:
+                            bw, bh = auto
+                            with self._lock:
+                                self._box_w = bw
+                                self._box_h = bh
+                                self.cfg["tracker"]["box_w_default"] = bw
+                                self.cfg["tracker"]["box_h_default"] = bh
+                                self._auto_box_notify = (bw, bh)
+
+                    ai_acq = self.cfg["tracker"].get("ai_acquisition", {})
+                    if ai_acq.get("enabled", False):
+                        snapped = self._ai_acquisition_snap(
+                            cx, cy, float(ai_acq.get("near_val", 150)), init_seq)
+                        if snapped is not None:
+                            bbox = snapped
+                            init_path = "ai_acquisition"
+
+                    if bbox is None:
+                        x = max(0, min(cx - bw // 2, iw - bw))
+                        y = max(0, min(cy - bh // 2, ih - bh))
+                        raw_bbox = (x, y, bw, bh)
+                        acq = self.cfg["tracker"].get("acq_assist", {})
+                        if acq.get("enabled", False):
+                            margin = float(acq.get("margin", 0.30))
+                            refined = self._acq_assist_refine(init_frame, raw_bbox, margin)
+                            if refined is not None:
+                                bbox = refined
+                                init_path = "acq_assist"
+                            else:
+                                bbox = raw_bbox
                         else:
                             bbox = raw_bbox
-                    else:
-                        bbox = raw_bbox
 
-                tracker = _create_tracker()
-                tracker.init(frame, bbox)
+                ttype = self.cfg["tracker"]["type"]
+                tracker = _create_tracker(ttype)
+                tracker.init(init_frame, bbox)
                 self._jump.init_tracker(bbox)
+                last_track_time = now
+                last_track_seq = init_seq
                 with self._lock:
                     self._bbox = bbox
+                    self._bbox_seq = init_seq
                 print(f"[PROC]  tracker init [{init_path}]  click=({cx},{cy})  "
-                      f"requested W×H={bw}x{bh}  -> bbox={bbox}")
+                      f"bbox={bbox}  click_seq={click_seq} init_seq={init_seq}")
+
+                # Iterative catch-up
+                catchup_from = init_seq
+                for _pass in range(5):
+                    with self._lock:
+                        gap = self._frame_seq - catchup_from
+                    if gap <= 2:
+                        break
+                    tracker, ok = self._catch_up_to_live(tracker, catchup_from)
+                    if not ok or tracker is None:
+                        tracker = None
+                        last_track_time = None
+                        last_track_seq = 0
+                        break
+                    else:
+                        last_track_time = time.monotonic()
+                        with self._lock:
+                            last_track_seq = self._bbox_seq
+                            catchup_from = self._bbox_seq
+
+                with self._lock:
+                    if self._paused:
+                        self._paused = False
+                        self._paused_seq = 0
+                        self._paused_frame = None
+                        print("[PROC]  auto-RESUMED after catch-up")
                 continue
 
             if tracker is not None:
@@ -583,62 +887,75 @@ class FrameProcessor:
                 success, bbox = tracker.update(frame)
                 dt_ms = (time.monotonic() - t0) * 1000
 
+                if last_track_time is not None:
+                    frames_skipped = frame_seq - last_track_seq
+                else:
+                    frames_skipped = 1
+
                 if not success:
-                    print(f"[PROC]  tracker LOST ({dt_ms:.1f}ms)")
+                    print(f"[PROC]  tracker LOST ({dt_ms:.1f}ms) seq={frame_seq}")
                     tracker = None
                     self._jump.reset()
+                    last_track_time = None
+                    last_track_seq = 0
                     with self._lock:
                         self._bbox = None
+                        self._bbox_seq = 0
                         self._track_ms = 0.0
-                        self._last_lost_reason = "csrt update failed"
+                        self._last_lost_reason = f"csrt update failed (skipped={frames_skipped})"
                     continue
 
-                # Jump check — compare to Kalman prediction
-                is_jump, metrics = self._jump.check(bbox)
+                is_jump, metrics = self._jump.check(bbox, frames_skipped)
                 if is_jump:
                     reason = (f"jump dist={metrics['dist_ratio']:.2f} "
                               f"size={metrics['size_ratio']:.2f} "
-                              f"iou={metrics['iou']:.2f}")
+                              f"iou={metrics['iou']:.2f} "
+                              f"skipped={frames_skipped}")
                     print(f"[PROC]  tracker JUMP — dropping ({reason})")
                     tracker = None
                     self._jump.reset()
+                    last_track_time = None
+                    last_track_seq = 0
                     with self._lock:
                         self._bbox = None
+                        self._bbox_seq = 0
                         self._track_ms = 0.0
                         self._last_lost_reason = reason
                     continue
+
+                last_track_time = now
+                last_track_seq = frame_seq
 
                 self._track_count += 1
                 with self._lock:
                     if self._pending_click == "clear":
                         continue
                     self._bbox = tuple(int(v) for v in bbox)
+                    self._bbox_seq = frame_seq
                     self._track_ms = dt_ms
 
-                # --- AI Assist: snap tracker to overlapping YOLO detection ---
                 ai_cfg = self.cfg["tracker"].get("ai_assist", {})
                 if (ai_cfg.get("enabled", False)
                         and self._track_count %
                             max(1, int(ai_cfg.get("interval", 30))) == 0):
                     snapped = self._ai_assist_snap(
                         frame, self._bbox,
-                        float(ai_cfg.get("iou_min", 0.10)))
+                        float(ai_cfg.get("iou_min", 0.10)),
+                        frame_seq)
                     if snapped is not None:
                         new_bbox, iou = snapped
-                        tracker = _create_tracker()
+                        ttype = self.cfg["tracker"]["type"]
+                        tracker = _create_tracker(ttype)
                         tracker.init(frame, new_bbox)
                         self._jump.init_tracker(new_bbox)
                         with self._lock:
                             self._bbox = new_bbox
-                            # show indicator for the next ~half second
+                            self._bbox_seq = frame_seq
                             self._ai_assist_until_count = self._track_count + 15
-                        print(f"[PROC]  ai_assist: snap (IoU={iou:.2f}) -> {new_bbox}")
 
                 if self._track_count == 1 or self._track_count % 30 == 0:
-                    msg = f"[PROC]  track update #{self._track_count}  {dt_ms:.1f}ms  bbox={self._bbox}"
-                    if metrics:
-                        msg += f"  dist={metrics['dist_ratio']:.2f} size={metrics['size_ratio']:.2f} iou={metrics['iou']:.2f}"
-                    print(msg)
+                    print(f"[PROC]  track #{self._track_count}  {dt_ms:.1f}ms  "
+                          f"bbox={self._bbox}  seq={frame_seq}")
 
     # ---------------- detector thread ----------------
 
@@ -676,6 +993,7 @@ class FrameProcessor:
         while True:
             with self._lock:
                 frame   = self._detector_frame
+                det_frame_seq = self._detector_frame_seq
                 enabled = self._detector_enabled
                 self._detector_frame = None
 
@@ -751,6 +1069,7 @@ class FrameProcessor:
                     continue
                 self._detections        = display_dets
                 self._detections_assist = assist_dets
+                self._det_seq           = det_frame_seq
                 self._det_ms            = dt_ms
                 self._det_count         = len(display_dets)
                 if frame_veh:
@@ -891,7 +1210,7 @@ class FrameProcessor:
 
     # ---------------- AI acquisition (click-time snap) ----------------
 
-    def _ai_acquisition_snap(self, click_x, click_y, near_val):
+    def _ai_acquisition_snap(self, click_x, click_y, near_val, current_seq=0):
         """
         On a fresh click, return the AABB of the YOLO detection whose centre
         is closest to (click_x, click_y) IF within `near_val` pixels.
@@ -899,6 +1218,9 @@ class FrameProcessor:
         can still snap.  Returns None when nothing qualifies.
         """
         with self._lock:
+            det_age = current_seq - self._det_seq if current_seq else 0
+            if det_age > self.MAX_DET_AGE:
+                return None
             dets = list(self._detections_assist)
         if not dets:
             return None
@@ -917,7 +1239,7 @@ class FrameProcessor:
 
     # ---------------- AI track assist ----------------
 
-    def _ai_assist_snap(self, frame, tracker_bbox, iou_min):
+    def _ai_assist_snap(self, frame, tracker_bbox, iou_min, current_seq=0):
         """
         If any YOLO detection overlaps the tracker bbox by IoU >= iou_min,
         return (detection_aabb, iou) — caller will reinit the tracker on it.
@@ -926,6 +1248,9 @@ class FrameProcessor:
         display on screen.  Returns None when no detection qualifies.
         """
         with self._lock:
+            det_age = current_seq - self._det_seq if current_seq else 0
+            if det_age > self.MAX_DET_AGE:
+                return None
             dets = list(self._detections_assist)
         if not dets:
             return None

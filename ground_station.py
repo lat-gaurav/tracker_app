@@ -39,8 +39,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QCheckBox, QTabWidget, QFormLayout, QGridLayout, QFrame,
     QMessageBox, QSlider, QScrollArea
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QPointF
+from PyQt6.QtGui import QFont, QPainter, QPen, QColor
 
 Gst.init(None)
 
@@ -104,22 +104,25 @@ class WSClient:
 
 
 class ClickableVideoWidget(QWidget):
-    """QWidget that captures mouse clicks and maps them to video coordinates."""
+    """QWidget that captures mouse clicks and drag-to-select rectangles."""
 
-    # Native video dimensions per rotation method
+    DRAG_THRESHOLD = 8
+
     VIDEO_DIMS = {
-        0: (1920, 1080),   # no rotation
-        1: (1080, 1920),   # 90° CW  — dimensions swap
-        2: (1920, 1080),   # 180°
-        3: (1080, 1920),   # 270° CW — dimensions swap
+        0: (1920, 1080),
+        1: (1080, 1920),
+        2: (1920, 1080),
+        3: (1080, 1920),
     }
 
-    def __init__(self, on_click, parent=None):
+    def __init__(self, on_click, on_drag=None, parent=None):
         super().__init__(parent)
-        self._on_click    = on_click
+        self._on_click = on_click
+        self._on_drag = on_drag
         self._rotate_method = 0
-        # Ensure the widget has its own native X11 window so xvimagesink can embed
-        # and correctly receive ConfigureNotify events on resize.
+        self._drag_start = None
+        self._drag_end = None
+        self._dragging = False
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -127,31 +130,71 @@ class ClickableVideoWidget(QWidget):
     def set_rotation(self, method):
         self._rotate_method = method
 
+    def _video_rect(self):
+        vw, vh = self.VIDEO_DIMS[self._rotate_method]
+        ww, wh = self.width(), self.height()
+        scale = min(ww / vw, wh / vh)
+        rw = vw * scale
+        rh = vh * scale
+        return (ww - rw) / 2, (wh - rh) / 2, rw, rh
+
+    def _widget_to_norm(self, px, py):
+        ox, oy, rw, rh = self._video_rect()
+        if px < ox or px > ox + rw or py < oy or py > oy + rh:
+            return None
+        return ((px - ox) / rw, (py - oy) / rh)
+
     def mousePressEvent(self, event):
         if event.button().name != 'LeftButton':
             return
-        vw, vh = self.VIDEO_DIMS[self._rotate_method]
-        ww, wh = self.width(), self.height()
+        self._drag_start = event.position()
+        self._drag_end = None
+        self._dragging = False
 
-        # Calculate actual rendered video rect (aspect-ratio preserved, centred)
-        scale     = min(ww / vw, wh / vh)
-        render_w  = vw * scale
-        render_h  = vh * scale
-        offset_x  = (ww - render_w) / 2
-        offset_y  = (wh - render_h) / 2
-
-        cx = event.position().x()
-        cy = event.position().y()
-
-        # Ignore clicks on black bars
-        if cx < offset_x or cx > offset_x + render_w:
+    def mouseMoveEvent(self, event):
+        if self._drag_start is None:
             return
-        if cy < offset_y or cy > offset_y + render_h:
-            return
+        self._drag_end = event.position()
+        dx = abs(self._drag_end.x() - self._drag_start.x())
+        dy = abs(self._drag_end.y() - self._drag_start.y())
+        if dx > self.DRAG_THRESHOLD or dy > self.DRAG_THRESHOLD:
+            self._dragging = True
+        if self._dragging:
+            self.update()
 
-        nx = (cx - offset_x) / render_w
-        ny = (cy - offset_y) / render_h
-        self._on_click(nx, ny)
+    def mouseReleaseEvent(self, event):
+        if event.button().name != 'LeftButton' or self._drag_start is None:
+            return
+        if self._dragging and self._drag_end is not None and self._on_drag:
+            p1 = self._widget_to_norm(self._drag_start.x(), self._drag_start.y())
+            p2 = self._widget_to_norm(self._drag_end.x(), self._drag_end.y())
+            if p1 and p2:
+                nx = min(p1[0], p2[0])
+                ny = min(p1[1], p2[1])
+                nw = abs(p2[0] - p1[0])
+                nh = abs(p2[1] - p1[1])
+                if nw > 0.005 and nh > 0.005:
+                    self._on_drag(nx, ny, nw, nh)
+        elif not self._dragging:
+            pt = self._widget_to_norm(self._drag_start.x(), self._drag_start.y())
+            if pt:
+                self._on_click(pt[0], pt[1])
+        self._drag_start = None
+        self._drag_end = None
+        self._dragging = False
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._dragging or self._drag_start is None or self._drag_end is None:
+            return
+        painter = QPainter(self)
+        pen = QPen(QColor(0, 255, 0, 200), 2, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QColor(0, 255, 0, 40))
+        x1, y1 = self._drag_start.x(), self._drag_start.y()
+        x2, y2 = self._drag_end.x(), self._drag_end.y()
+        painter.drawRect(int(min(x1,x2)), int(min(y1,y2)), int(abs(x2-x1)), int(abs(y2-y1)))
+        painter.end()
 
 
 class GroundStation(QMainWindow):
@@ -223,7 +266,7 @@ class GroundStation(QMainWindow):
         self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # Page 0 — xvimagesink renders here
-        self.video_widget = ClickableVideoWidget(self._on_video_click)
+        self.video_widget = ClickableVideoWidget(self._on_video_click, self._on_video_drag)
         self.video_widget.setStyleSheet("background-color: black;")
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_stack.addWidget(self.video_widget)
@@ -349,6 +392,12 @@ class GroundStation(QMainWindow):
         self.detect_btn.setCheckable(True)
         self.detect_btn.clicked.connect(self._toggle_detect)
 
+        self._paused = False
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setFixedWidth(80)
+        self.pause_btn.setCheckable(True)
+        self.pause_btn.clicked.connect(self._toggle_pause)
+
         self._recording = False
         self.rec_btn = QPushButton("REC")
         self.rec_btn.setFixedWidth(60)
@@ -409,6 +458,8 @@ class GroundStation(QMainWindow):
         bottom_bar.addWidget(QLabel("H")); bottom_bar.addWidget(self.box_h_input)
         bottom_bar.addSpacing(12)
         bottom_bar.addWidget(self.stop_track_btn)
+        bottom_bar.addSpacing(4)
+        bottom_bar.addWidget(self.pause_btn)
         bottom_bar.addSpacing(4)
         bottom_bar.addWidget(self.detect_btn)
         bottom_bar.addSpacing(4)
@@ -705,6 +756,25 @@ class GroundStation(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(10, 8, 10, 8)
         form.setSpacing(6)
+
+        form.addRow(self._section_header("Tracker engine"))
+        self.tracker_type_combo = QComboBox()
+        self.tracker_type_combo.addItem("CSRT — best accuracy (~23ms)", "csrt")
+        self.tracker_type_combo.addItem("CSRT Fast — good accuracy (~5ms)", "csrt-fast")
+        self.tracker_type_combo.addItem("CSRT Faster — decent (~3ms)", "csrt-faster")
+        self.tracker_type_combo.addItem("CSRT Ultra — basic (~1ms)", "csrt-ultra")
+        self.tracker_type_combo.addItem("KCF — balanced (~5ms)", "kcf")
+        self.tracker_type_combo.addItem("MOSSE — fastest (~1ms)", "mosse")
+        self.tracker_type_combo.currentIndexChanged.connect(
+            lambda i: self._set_param("tracker.type",
+                                      self.tracker_type_combo.itemData(i))
+            if i >= 0 else None)
+        self._param_widgets["tracker.type"] = self.tracker_type_combo
+        form.addRow("Type:", self.tracker_type_combo)
+        type_note = QLabel("Switches live. CSRT Fast is the best all-round choice.")
+        type_note.setStyleSheet("color: #888888; font-size: 10px;")
+        type_note.setWordWrap(True)
+        form.addRow("", type_note)
 
         # --- Init box & assists ---
         form.addRow(self._section_header("Init box"))
@@ -1178,9 +1248,31 @@ class GroundStation(QMainWindow):
             self.ws_response_label.setText(f"Sent: source:{os.path.basename(path)}")
             self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
+    def _toggle_pause(self):
+        self._paused = not self._paused
+        if self._paused:
+            self._ws_client.send("pause")
+            self.pause_btn.setText("Resume")
+            self.pause_btn.setStyleSheet("background-color: #cc6600; color: white; font-weight: bold;")
+            self.ws_response_label.setText("PAUSED — click or drag on target")
+            self.ws_response_label.setStyleSheet("color: #ff8800; font-size: 11px;")
+        else:
+            self._ws_client.send("resume")
+            self.pause_btn.setText("Pause")
+            self.pause_btn.setStyleSheet("")
+            self.ws_response_label.setText("Resumed")
+            self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
     def _on_video_click(self, nx, ny):
         self._ws_client.send(f"click:{nx:.4f},{ny:.4f}")
-        self.ws_response_label.setText(f"Sent: click ({nx:.3f}, {ny:.3f})")
+        tag = " (paused)" if self._paused else ""
+        self.ws_response_label.setText(f"Sent: click ({nx:.3f}, {ny:.3f}){tag}")
+        self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+
+    def _on_video_drag(self, nx, ny, nw, nh):
+        self._ws_client.send(f"drag:{nx:.4f},{ny:.4f},{nw:.4f},{nh:.4f}")
+        tag = " (paused)" if self._paused else ""
+        self.ws_response_label.setText(f"Sent: drag ({nx:.3f},{ny:.3f} {nw:.3f}x{nh:.3f}){tag}")
         self.ws_response_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
     def _send_command(self):
@@ -1197,6 +1289,15 @@ class GroundStation(QMainWindow):
             self.ws_response_label.setText(f"Camera: {msg}")
             color = "#00cc44" if "OK" in msg or "reply" in msg else "#ff3333"
             self.ws_response_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            return
+        if msg == "status:resumed":
+            if self._paused:
+                self._paused = False
+                self.pause_btn.setChecked(False)
+                self.pause_btn.setText("Pause")
+                self.pause_btn.setStyleSheet("")
+                self.ws_response_label.setText("Catch-up complete — live tracking resumed")
+                self.ws_response_label.setStyleSheet("color: #00cc44; font-size: 11px;")
             return
         if msg.startswith("status:tracking "):
             info = msg[len("status:tracking "):]

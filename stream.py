@@ -455,6 +455,32 @@ def capture_and_push():
 
         processor.submit_frame(frame)
 
+        # ---- Pause-and-select: decide which frame goes to display ----
+        paused, catching_up, frozen_frame, cu_frame = processor.get_display_state()
+        if catching_up:
+            if cu_frame is not None:
+                display_frame = cu_frame.copy()
+                display_frame = processor.draw(display_frame)
+            elif frozen_frame is not None:
+                display_frame = frozen_frame.copy()
+                display_frame = processor.draw(display_frame, paused_view=True)
+            else:
+                display_frame = processor.draw(frame)
+            cv2.putText(display_frame, "CATCHING UP",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 165, 255), 2, cv2.LINE_AA)
+        elif paused:
+            if frozen_frame is not None:
+                display_frame = frozen_frame.copy()
+            else:
+                display_frame = frame.copy()
+            display_frame = processor.draw(display_frame, paused_view=True)
+            cv2.putText(display_frame, "PAUSED",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            display_frame = processor.draw(frame)
+
         # ---- Recording: enqueue clean frame + overlay snapshot (non-blocking) ----
         if _rec_active and _rec_queue is not None:
             try:
@@ -462,9 +488,12 @@ def capture_and_push():
                     ov = {
                         "ts": time.time(),
                         "frame": _rec_frame_n + 1,
+                        "frame_seq": processor._frame_seq,
                         "tracker_bbox": list(processor._bbox) if processor._bbox else None,
+                        "tracker_bbox_seq": processor._bbox_seq,
                         "track_ms": round(processor._track_ms, 1),
                         "ai_active": processor._track_count < processor._ai_assist_until_count,
+                        "det_seq": processor._det_seq,
                         "detections": [
                             {"label": d["label"],
                              "conf": round(d["conf"], 3),
@@ -480,11 +509,9 @@ def capture_and_push():
             except Exception as e:
                 print(f"[REC]   enqueue error: {e}")
 
-        frame = processor.draw(frame)
-
         # Push processed frame to appsrc
         if _appsrc is not None:
-            out_buf = Gst.Buffer.new_wrapped(frame.tobytes())
+            out_buf = Gst.Buffer.new_wrapped(display_frame.tobytes())
             out_buf.pts      = pts
             out_buf.duration = frame_duration_ns
             pts += frame_duration_ns
@@ -579,9 +606,14 @@ async def ws_handle(websocket):
 
     async def status_sender():
         """Push tracking + detection stats to ground once per second."""
+        _was_paused = False
         try:
             while True:
                 await asyncio.sleep(1.0)
+                paused_now, _, catching_up = processor.is_paused()
+                if _was_paused and not paused_now:
+                    await websocket.send("status:resumed")
+                _was_paused = paused_now or catching_up
                 tracking, t_ms = processor.get_track_info()
                 if tracking:
                     await websocket.send(f"status:tracking {t_ms:.1f}ms")
@@ -629,6 +661,14 @@ async def ws_handle(websocket):
             elif message == "clear_track":
                 processor.clear_track()
                 reply = "Tracker cleared"
+
+            elif message == "pause":
+                processor.pause()
+                reply = "Paused"
+
+            elif message == "resume":
+                processor.resume()
+                reply = "Resumed"
 
             elif message.startswith("detect:"):
                 val = message.split(":", 1)[1].strip().lower()
@@ -755,6 +795,21 @@ async def ws_handle(websocket):
                     reply = f"Click set at ({ox:.3f}, {oy:.3f}) [original space]"
                 except (ValueError, IndexError):
                     reply = "Error: invalid click command"
+
+            elif message.startswith("drag:"):
+                try:
+                    _, vals = message.split(":", 1)
+                    nx, ny, nw, nh = map(float, vals.split(","))
+                    ox1, oy1 = rotated_to_original(nx, ny, _rotation)
+                    ox2, oy2 = rotated_to_original(nx + nw, ny + nh, _rotation)
+                    onx = min(ox1, ox2)
+                    ony = min(oy1, oy2)
+                    onw = abs(ox2 - ox1)
+                    onh = abs(oy2 - oy1)
+                    processor.set_drag(onx, ony, onw, onh)
+                    reply = f"Drag set at ({onx:.3f},{ony:.3f} {onw:.3f}x{onh:.3f})"
+                except (ValueError, IndexError):
+                    reply = "Error: invalid drag command"
 
             elif message.startswith("visca:"):
                 if visca_cam is None or not visca_cam.is_open:
